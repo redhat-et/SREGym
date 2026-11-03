@@ -26,8 +26,9 @@ from pathlib import Path
 
 from logger import init_logger
 from sregym.cluster_platform import KIND, PLATFORMS, set_platform
-from sregym.conductor.conductor import Conductor, ConductorConfig
+from sregym.conductor.conductor import Conductor, ConductorConfig, reconcile_refusal
 from sregym.profile import PROFILES, set_profile
+from sregym.service.cluster_state import RECONCILE_MODES
 
 logger = logging.getLogger("all.sregym.validate_problem")
 
@@ -89,7 +90,13 @@ def _mark_failure(stages: dict, message: str):
 
 
 def validate(
-    problem_id: str, inject_timeout: int, recover_timeout: int, poll_interval: int, *, deploy_loki: bool = False
+    problem_id: str,
+    inject_timeout: int,
+    recover_timeout: int,
+    poll_interval: int,
+    *,
+    deploy_loki: bool = False,
+    reconcile: str | None = None,
 ):
     """Run the full deploy/inject/recover lifecycle. Returns (passed, stages)."""
     stages = {
@@ -107,7 +114,7 @@ def validate(
     recovery_verified = False
     deployed = False
     try:
-        conductor = Conductor(config=ConductorConfig(deploy_loki=deploy_loki))
+        conductor = Conductor(config=ConductorConfig(deploy_loki=deploy_loki, reconcile=reconcile))
 
         # --- Resolve the problem ----------------------------------------------
         logger.info(f"[STAGE] Resolving problem '{problem_id}'")
@@ -298,6 +305,25 @@ def main():
             "already provides."
         ),
     )
+    parser.add_argument(
+        "--reconcile",
+        choices=RECONCILE_MODES,
+        default=None,
+        help=(
+            "What per-problem cleanup does with the cluster baseline. 'on' reconciles the cluster back to "
+            "it; 'report' logs every write that would make and makes none; 'off' keeps the baseline as a "
+            "record only. Default: 'on' on kind, 'off' on openshift."
+        ),
+    )
+    parser.add_argument(
+        "--confirm-destructive-reconcile",
+        action="store_true",
+        default=False,
+        help=(
+            "Accept that --reconcile on deletes every object absent from the baseline, including platform "
+            "objects on a managed cluster. Required for 'on' on openshift."
+        ),
+    )
     parser.add_argument("--with-loki", action="store_true", help="Also validate deployment of Loki and Promtail")
     parser.add_argument(
         "--inject-timeout",
@@ -322,11 +348,21 @@ def main():
     init_logger()
     set_profile(args.profile)
     set_platform(args.platform)
+    # Reconcile deletes every object absent from the baseline, so on a managed
+    # platform it needs a second yes before any cluster work starts.
+    refusal = reconcile_refusal(args.reconcile, args.confirm_destructive_reconcile)
+    if refusal:
+        sys.exit(refusal)
     logger.info(f"Starting validation for problem: {args.problem}")
     start = time.time()
 
     passed, stages = validate(
-        args.problem, args.inject_timeout, args.recover_timeout, args.poll_interval, deploy_loki=args.with_loki
+        args.problem,
+        args.inject_timeout,
+        args.recover_timeout,
+        args.poll_interval,
+        deploy_loki=args.with_loki,
+        reconcile=args.reconcile,
     )
 
     elapsed = time.time() - start

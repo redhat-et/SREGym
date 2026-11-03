@@ -28,7 +28,7 @@ from logger import console, init_logger
 from sregym.agent_launcher import AgentLauncher
 from sregym.agent_registry import get_agent, list_agents
 from sregym.cluster_platform import KIND, PLATFORMS, PlatformVerificationError, set_platform
-from sregym.conductor.conductor import ALL_STAGES, Conductor, ConductorConfig
+from sregym.conductor.conductor import ALL_STAGES, Conductor, ConductorConfig, reconcile_refusal
 from sregym.conductor.conductor_api import request_shutdown, run_api
 from sregym.conductor.problem_sets import PROBLEM_SETS
 from sregym.phases import read_ledger as read_phase_ledger
@@ -36,6 +36,7 @@ from sregym.phases import results_columns as phase_results_columns
 from sregym.profile import PROFILES, get_profile, set_profile
 from sregym.results.resume import complete_resume_rows
 from sregym.run_artifacts import ArtifactFinalizationError, RunArtifacts, stabilize_run_csv_headers
+from sregym.service.cluster_state import RECONCILE_MODES
 from sregym.service.container_runner import ContainerRunner, ExecInput, get_container_host_bind_address
 from sregym.service.internet_policy import EndpointRule, InternetPolicy
 from sregym.service.judge_runtime import JUDGE_BACKENDS, managed_judge_backend
@@ -934,6 +935,11 @@ def _run_benchmark(args, *, judge_backend: str = "api", agent_image: str | None 
     agent_model, judge_model = _configure_model_environment(args)
     # The platform has to be known before anything derives behaviour from it.
     set_platform(args.platform)
+    # Reconcile deletes every object absent from the baseline, so on a managed
+    # platform it needs a second yes before any cluster work starts.
+    refusal = reconcile_refusal(getattr(args, "reconcile", None), getattr(args, "confirm_destructive_reconcile", False))
+    if refusal:
+        sys.exit(refusal)
     internet_policy = InternetPolicy.from_mode(
         args.internet_access,
         agent_name=args.agent,
@@ -1000,6 +1006,7 @@ def _run_benchmark(args, *, judge_backend: str = "api", agent_image: str | None 
         stages=tuple(args.stages) if args.stages else None,
         baseline_override_s=getattr(args, "baseline", None),
         propagation_override_s=getattr(args, "propagation", None),
+        reconcile=getattr(args, "reconcile", None),
     )
     LAUNCHER.set_internet_policy(conductor_config.internet_policy)
     LAUNCHER.set_container_hardening(harden_container)
@@ -1235,6 +1242,25 @@ if __name__ == "__main__":
             "Cluster platform. 'kind' (default) is a local kind cluster. 'openshift' is a managed "
             "OpenShift cluster: the harness then skips installing cluster-wide components (such as the "
             "metrics API) the platform already provides."
+        ),
+    )
+    parser.add_argument(
+        "--reconcile",
+        choices=RECONCILE_MODES,
+        default=None,
+        help=(
+            "What per-problem cleanup does with the cluster baseline. 'on' reconciles the cluster back to "
+            "it; 'report' logs every write that would make and makes none; 'off' keeps the baseline as a "
+            "record only. Default: 'on' on kind, 'off' on openshift."
+        ),
+    )
+    parser.add_argument(
+        "--confirm-destructive-reconcile",
+        action="store_true",
+        default=False,
+        help=(
+            "Accept that --reconcile on deletes every object absent from the baseline, including platform "
+            "objects on a managed cluster. Required for 'on' on openshift."
         ),
     )
     parser.add_argument(

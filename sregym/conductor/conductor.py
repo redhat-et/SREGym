@@ -46,7 +46,13 @@ from sregym.phases import PhaseLedger
 from sregym.profile import is_svelte
 from sregym.service.apps.app_registry import AppRegistry
 from sregym.service.cluster_egress import ClusterEgressBoundary
-from sregym.service.cluster_state import ClusterStateManager
+from sregym.service.cluster_state import (
+    RECONCILE_MODES,
+    RECONCILE_OFF,
+    RECONCILE_ON,
+    RECONCILE_REPORT,
+    ClusterStateManager,
+)
 from sregym.service.internet_policy import InternetPolicy
 from sregym.service.k8s_proxy import KubernetesAPIProxy
 from sregym.service.kubectl import WAIT_FOR_POD_READY_TIMEOUT, KubeCtl
@@ -59,6 +65,37 @@ from sregym.service.telemetry.prometheus import Prometheus
 # `--stages`' choices so the CLI and the conductor cannot disagree about what
 # exists.
 ALL_STAGES = ("diagnosis", "mitigation")
+
+
+def resolve_reconcile_mode(requested: str | None) -> str:
+    """Return the reconcile mode to use, with the platform default when none was requested.
+
+    A local kind cluster is disposable, so reconciling it back to the baseline is
+    the default there. A managed platform is not: its baseline is a snapshot of a
+    bare cluster, so the objects absent from it belong to the platform, and
+    deleting them is not cleanup. The default there is to report only.
+    """
+    if requested is not None:
+        if requested not in RECONCILE_MODES:
+            raise ValueError(f"Unknown reconcile mode {requested!r}; expected one of {RECONCILE_MODES}")
+        return requested
+    return RECONCILE_OFF if is_openshift() else RECONCILE_ON
+
+
+def reconcile_refusal(requested: str | None, confirmed: bool) -> str | None:
+    """Return the one-line refusal for an unconfirmed destructive reconcile, or None.
+
+    Reconcile deletes every object absent from the baseline. On a managed platform
+    that set includes platform objects, so asking for it takes two answers: the
+    mode, and the confirmation. Both entry points answer before any cluster work.
+    """
+    if confirmed or resolve_reconcile_mode(requested) != RECONCILE_ON or not is_openshift():
+        return None
+    return (
+        "Refusing --reconcile on: reconcile deletes every object absent from the baseline, and on this "
+        "platform that includes platform objects. Re-run with --reconcile report to list those writes "
+        "without making them, or add --confirm-destructive-reconcile to accept the deletion."
+    )
 
 
 @dataclass
@@ -76,6 +113,10 @@ class ConductorConfig:
     stages: tuple[str, ...] | None = None
     baseline_override_s: int | None = None  # overrides per-problem baseline_duration_s when set
     propagation_override_s: int | None = None  # overrides per-problem propagation_duration_s when set
+    # What cleanup does with the baseline: "on", "report" or "off". None means the
+    # platform decides, which cannot be a dataclass default because that would call
+    # get_platform() at import time.
+    reconcile: str | None = None
 
     @property
     def restrict_network_access(self) -> bool:
@@ -105,6 +146,9 @@ class Conductor:
         self.cluster_state = ClusterStateManager(self.kubectl)
         self.cluster_egress = ClusterEgressBoundary(self.kubectl)
         self._baseline_captured = False
+        # False once the persisted baseline is refused for describing a cluster that
+        # no longer exists: reconcile then has nothing trustworthy to aim at.
+        self._baseline_usable = True
         self._platform_verified = False
 
         # Kubernetes API proxy to hide chaos engineering namespaces and load generators from agents
@@ -138,6 +182,15 @@ class Conductor:
 
         self.tasklist = None
         self.logger = logging.getLogger("all.sregym.conductor")
+
+        # Resolved once, here, so every cleanup in this run uses the same mode. No
+        # I/O: the only input is the requested value or the platform singleton.
+        self.reconcile = resolve_reconcile_mode(self.config.reconcile)
+        self.logger.info(
+            "[CLEANUP] Reconcile mode: %s (%s)",
+            self.reconcile,
+            "requested" if self.config.reconcile is not None else f"platform default for {get_platform()}",
+        )
 
         # Phase-boundary ledger, bound per attempt by whoever owns the run
         # directory (main.py). Left unset by cli.py, the external harness and
@@ -624,12 +677,28 @@ class Conductor:
 
         # Reconcile cluster state to baseline
         if self._baseline_captured:
-            self.logger.info("[CLEANUP] Reconciling cluster state to baseline...")
             try:
-                changes = self.cluster_state.reconcile_to_baseline()
-                if any(v for v in changes.values() if v):
-                    self.logger.info(f"Cluster state reconciliation changes: {changes}")
-                self.logger.info("[CLEANUP] Cluster state reconciled")
+                if not self._baseline_usable:
+                    self.logger.info(
+                        "[CLEANUP] Reconcile skipped: the persisted baseline names namespaces that no longer "
+                        "exist, so it is neither usable nor replaced"
+                    )
+                elif self.reconcile == RECONCILE_ON:
+                    self.logger.info("[CLEANUP] Reconciling cluster state to baseline...")
+                    changes = self.cluster_state.reconcile_to_baseline()
+                    if any(v for v in changes.values() if v):
+                        self.logger.info(f"Cluster state reconciliation changes: {changes}")
+                    self.logger.info("[CLEANUP] Cluster state reconciled")
+                elif self.reconcile == RECONCILE_REPORT:
+                    mutations = self.cluster_state.plan_reconcile()
+                    self.logger.info(f"[CLEANUP] Reconcile report: {len(mutations)} mutations, none applied")
+                    for mutation in mutations:
+                        self.logger.info(f"[CLEANUP] would {mutation.action} {mutation.target} — {mutation.note}")
+                else:
+                    self.logger.info(
+                        "[CLEANUP] Reconcile skipped (off): the baseline is kept for reporting, "
+                        "it is not an ownership map"
+                    )
             except Exception as e:
                 self.logger.exception("[CLEANUP] Failed to reconcile cluster state")
                 cleanup_errors.append(f"cluster_reconcile: {type(e).__name__}: {e}")
@@ -1488,12 +1557,30 @@ class Conductor:
         # This captures the bare cluster state so reconciliation can clean up
         # everything added during a problem run (including infrastructure drift).
         if not self._baseline_captured:
-            if self.cluster_state.load_baseline_state(CLUSTER_BASELINE_STATE_FILE):
+            # The problem's own namespaces are created after the snapshot, so the
+            # staleness check has to accept them. Sorted, so the check is comparable
+            # between runs, and deduplicated, since a composite app repeats its first
+            # namespace in `namespaces`.
+            allow_missing = tuple(sorted(n for n in {problem.namespace, *getattr(problem.app, "namespaces", ())} if n))
+            if self.cluster_state.load_baseline_state(CLUSTER_BASELINE_STATE_FILE, allow_missing=allow_missing):
                 self.logger.info("[DEPLOY] Loaded persisted cluster baseline state")
+            elif self.cluster_state.baseline_load_status == "stale":
+                # Capture-and-save here would overwrite the only record of the cluster
+                # this run expected with a capture of the cluster it actually got.
+                self.logger.error(
+                    "[DEPLOY] The persisted cluster baseline names namespaces that no longer exist, so it is "
+                    "neither usable nor replaced; reconcile stays disabled for this run"
+                )
+                self._baseline_usable = False
             else:
                 self.logger.info("[DEPLOY] No persisted baseline state found, capturing and saving...")
                 self.cluster_state.save_baseline_state(CLUSTER_BASELINE_STATE_FILE)
             self._baseline_captured = True
+            if is_openshift() and self._baseline_usable:
+                self.logger.info(
+                    "[DEPLOY] The cluster baseline is kept for reporting only; it is not an ownership map: "
+                    "reconcile is off by default on this platform"
+                )
 
         self.logger.info("[DEPLOY] Checking Kubernetes pod networking…")
         if is_openshift():

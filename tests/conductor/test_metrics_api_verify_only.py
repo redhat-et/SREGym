@@ -6,6 +6,7 @@ so the guarded path must be a wait, not an install.
 """
 
 import logging
+from types import SimpleNamespace
 from unittest.mock import MagicMock, call
 
 import pytest
@@ -55,13 +56,19 @@ def test_openshift_touches_nothing_in_kube_system(monkeypatch):
         untouched.assert_not_called()
 
 
-def test_openshift_says_why_components_yaml_is_not_applied(monkeypatch, caplog):
+def test_openshift_says_why_components_yaml_is_not_applied(monkeypatch):
     conductor = _conductor(monkeypatch, OPENSHIFT)
+    messages: list[str] = []
+    conductor.logger = SimpleNamespace(
+        info=messages.append,
+        warning=messages.append,
+        debug=messages.append,
+        error=messages.append,
+        exception=messages.append,
+    )
 
-    with caplog.at_level(logging.INFO, logger="test.metrics_api_verify_only"):
-        conductor._ensure_metrics_api()
+    conductor._ensure_metrics_api()
 
-    messages = [record.getMessage() for record in caplog.records]
     assert any(
         "serves metrics.k8s.io itself" in message and "APIService" in message and "RBAC" in message
         for message in messages

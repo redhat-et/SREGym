@@ -3,7 +3,9 @@
 import hashlib
 import json
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 
 from kubernetes import client
@@ -35,6 +37,16 @@ logger.setLevel(logging.DEBUG)
 PROTECTED_NAMESPACES = frozenset(
     {"kube-system", "kube-public", "kube-node-lease", "default", "sregym", "chaos-mesh", "openebs"}
 )
+
+# What cleanup does with the baseline. `on` reconciles back to it, `report`
+# lists the writes it would make and makes none, `off` keeps the baseline as a
+# record only. A disposable local cluster can be reconciled; a managed platform
+# cannot, because its baseline is not an ownership map: the objects absent from
+# it belong to the platform, not to the run.
+RECONCILE_ON = "on"
+RECONCILE_REPORT = "report"
+RECONCILE_OFF = "off"
+RECONCILE_MODES = (RECONCILE_ON, RECONCILE_REPORT, RECONCILE_OFF)
 
 
 def _is_chaos_mesh_resource(name: str) -> bool:
@@ -161,12 +173,78 @@ class ClusterBaseline:
         )
 
 
+@dataclass(frozen=True)
+class ReconcileMutation:
+    """One write that reconciliation would make, in the order it would make it."""
+
+    action: str  # "delete" / "patch" / "replace" / "create" / "exec"
+    target: str  # "namespace/foo", "clusterrole/bar", "node/worker-1 label x"
+    note: str  # one short line saying why, for a log
+    apply: Callable[[], None]
+
+
+class _ReconcileSink:
+    """Collects one reconciliation pass: every write goes through `do`, every result through `changed`."""
+
+    def __init__(self) -> None:
+        self.changes: dict = {
+            "namespaces_deleted": [],
+            "cluster_roles_deleted": [],
+            "cluster_role_bindings_deleted": [],
+            "persistent_volumes_deleted": [],
+            "storage_classes_deleted": [],
+            "crds_deleted": [],
+            "validating_webhook_configs_deleted": [],
+            "mutating_webhook_configs_deleted": [],
+            "validating_admission_policies_deleted": [],
+            "validating_admission_policy_bindings_deleted": [],
+            "nodes_labels_reset": [],
+            "nodes_taints_reset": [],
+            "coredns_reset": False,
+        }
+
+    def do(self, action: str, target: str, note: str, apply: Callable[[], None]) -> None:
+        """Handle one write: perform it, or record it for a report."""
+        raise NotImplementedError
+
+    def changed(self, key: str, value) -> None:
+        """Record one result. List-valued keys append; scalar keys overwrite."""
+        current = self.changes.get(key)
+        if isinstance(current, list):
+            current.append(value)
+        else:
+            self.changes[key] = value
+
+
+class _ApplyingSink(_ReconcileSink):
+    """Performs each write as it arrives: the behaviour of `reconcile_to_baseline`."""
+
+    def do(self, action: str, target: str, note: str, apply: Callable[[], None]) -> None:
+        apply()
+
+
+class _PlanningSink(_ReconcileSink):
+    """Records each write and performs none of them."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.mutations: list[ReconcileMutation] = []
+
+    def do(self, action: str, target: str, note: str, apply: Callable[[], None]) -> None:
+        self.mutations.append(ReconcileMutation(action, target, note, apply))
+
+
 class ClusterStateManager:
     """Manages cluster state snapshots and reconciliation for benchmark isolation."""
 
     def __init__(self, kubectl: KubeCtl):
         self.kubectl = kubectl
         self.baseline: ClusterBaseline | None = None
+        # Why the last `load_baseline_state` returned what it did: "not_attempted",
+        # "loaded", "missing", "foreign_cluster", "corrupt" or "stale". The caller
+        # decides what to do with the answer; a refusal is not a licence to overwrite.
+        self.baseline_load_status = "not_attempted"
+        self.stale_namespaces: list[str] = []
 
         # Initialize Kubernetes API clients
         self.core_v1 = client.CoreV1Api()
@@ -213,13 +291,21 @@ class ClusterStateManager:
             json.dump(baseline.to_json(), f, indent=2)
         logger.info(f"Baseline state snapshot saved to {path}")
 
-    def load_baseline_state(self, path: Path) -> bool:
+    def load_baseline_state(self, path: Path, allow_missing: tuple[str, ...] = ()) -> bool:
         """
         Load a previously saved baseline state snapshot and use it as the baseline.
         Returns True if the baseline state was loaded successfully, False otherwise.
+
+        `allow_missing` names namespaces the current problem creates after the
+        baseline was captured; only those are exempt from the staleness check. A
+        snapshot naming any other namespace that no longer exists describes a
+        cluster that is gone: it cannot say what to delete, and it must not be
+        replaced with a fresh capture of a cluster that may still be dirty.
         """
+        self.stale_namespaces = []
         if not path.exists():
             logger.debug(f"No baseline state file found at {path}")
+            self.baseline_load_status = "missing"
             return False
 
         try:
@@ -229,6 +315,7 @@ class ClusterStateManager:
             saved_cluster_uid = data.get("cluster_uid")
             if not saved_cluster_uid:
                 logger.warning(f"Ignoring baseline state at {path}: snapshot has no cluster identity")
+                self.baseline_load_status = "corrupt"
                 return False
             if saved_cluster_uid != current_cluster_uid:
                 logger.warning(
@@ -237,6 +324,7 @@ class ClusterStateManager:
                     saved_cluster_uid,
                     current_cluster_uid,
                 )
+                self.baseline_load_status = "foreign_cluster"
                 return False
             # Legacy snapshots did not record these resources. Preserve what
             # exists before this attempt, rather than treating it as unexpected.
@@ -246,11 +334,29 @@ class ClusterStateManager:
             ):
                 if field_name not in data:
                     data[field_name] = sorted(self._get_admission_policy_names(resource))
-            self.baseline = ClusterBaseline.from_json(data)
+            baseline = ClusterBaseline.from_json(data)
+            # Read with raise_on_error so a permission failure refuses the snapshot
+            # instead of looking like a cluster where everything the baseline names
+            # has disappeared.
+            live_namespaces = self._get_namespaces(raise_on_error=True)
+            stale = sorted(baseline.namespaces - live_namespaces - PROTECTED_NAMESPACES - set(allow_missing))
+            if stale:
+                logger.error(
+                    "Ignoring baseline state at %s: it names namespace(s) that no longer exist (%s), so it is "
+                    "neither usable as a reference nor replaced with a fresh capture",
+                    path,
+                    ", ".join(stale),
+                )
+                self.stale_namespaces = stale
+                self.baseline_load_status = "stale"
+                return False
+            self.baseline = baseline
+            self.baseline_load_status = "loaded"
             logger.info(f"Baseline state loaded from {path}")
             return True
         except (json.JSONDecodeError, KeyError) as e:
             logger.warning(f"Failed to load baseline state from {path}: {e}")
+            self.baseline_load_status = "corrupt"
             return False
 
     def reconcile_to_baseline(self) -> dict:
@@ -258,55 +364,78 @@ class ClusterStateManager:
         Reset cluster to baseline state.
         Returns a summary of changes made.
         """
+        return self._reconcile(_ApplyingSink())
+
+    def plan_reconcile(self) -> list[ReconcileMutation]:
+        """List every write `reconcile_to_baseline` would make, in order, and make none of them."""
+        sink = _PlanningSink()
+        self._reconcile(sink)
+        return sink.mutations
+
+    def apply_reconcile(self, mutations: list[ReconcileMutation]) -> None:
+        """Perform a plan from `plan_reconcile`, in order."""
+        for mutation in mutations:
+            mutation.apply()
+
+    def _reconcile(self, sink: _ReconcileSink) -> dict:
+        """
+        Compute the difference between the cluster and the baseline, handing every write to `sink`.
+        Returns the changes the sink recorded.
+        """
         if self.baseline is None:
             logger.warning("No baseline captured. Skipping reconciliation.")
             return {"skipped": True, "reason": "no_baseline"}
 
         logger.info("Reconciling cluster to baseline state...")
-        changes = {
-            "namespaces_deleted": [],
-            "cluster_roles_deleted": [],
-            "cluster_role_bindings_deleted": [],
-            "persistent_volumes_deleted": [],
-            "storage_classes_deleted": [],
-            "crds_deleted": [],
-            "validating_webhook_configs_deleted": [],
-            "mutating_webhook_configs_deleted": [],
-            "validating_admission_policies_deleted": [],
-            "validating_admission_policy_bindings_deleted": [],
-            "nodes_labels_reset": [],
-            "nodes_taints_reset": [],
-            "coredns_reset": False,
-        }
 
         # Remove bindings before policies or namespaces, since an attempt's
         # policy can otherwise reject resource deletion during cleanup.
-        for field_name, resource, delete in (
+        for field_name, resource, kind, delete in (
             (
                 "validating_admission_policy_bindings",
                 "bindings",
+                "validatingadmissionpolicybinding",
                 self.admission_v1.delete_validating_admission_policy_binding,
             ),
-            ("validating_admission_policies", "policies", self.admission_v1.delete_validating_admission_policy),
+            (
+                "validating_admission_policies",
+                "policies",
+                "validatingadmissionpolicy",
+                self.admission_v1.delete_validating_admission_policy,
+            ),
         ):
             for name in sorted(self._get_admission_policy_names(resource) - getattr(self.baseline, field_name)):
-                try:
-                    delete(name=name)
-                except ApiException as error:
-                    if error.status != 404:
-                        raise
-                changes[f"{field_name}_deleted"].append(name)
+
+                def _delete_admission_policy(name=name, delete=delete, field_name=field_name):
+                    try:
+                        delete(name=name)
+                    except ApiException as error:
+                        if error.status != 404:
+                            raise
+                    sink.changed(f"{field_name}_deleted", name)
+
+                sink.do(
+                    "delete",
+                    f"{kind}/{name}",
+                    f"{resource} added since the baseline",
+                    _delete_admission_policy,
+                )
 
         # 1. Delete unexpected namespaces
         current_namespaces = self._get_namespaces()
         unexpected_namespaces = current_namespaces - self.baseline.namespaces - PROTECTED_NAMESPACES
         for ns in unexpected_namespaces:
             logger.info(f"Deleting unexpected namespace: {ns}")
-            try:
-                self.kubectl.delete_namespace(ns)
-                changes["namespaces_deleted"].append(ns)
-            except Exception as e:
-                logger.warning(f"Failed to delete namespace {ns}: {e}")
+
+            def _delete_namespace(ns=ns):
+                try:
+                    self.kubectl.delete_namespace(ns)
+                except Exception as e:
+                    logger.warning(f"Failed to delete namespace {ns}: {e}")
+                    return
+                sink.changed("namespaces_deleted", ns)
+
+            sink.do("delete", f"namespace/{ns}", "namespace added since the baseline", _delete_namespace)
 
         # 2. Delete unexpected ClusterRoles
         current_cluster_roles = self._get_cluster_roles()
@@ -318,12 +447,17 @@ class ClusterStateManager:
             if _is_chaos_mesh_resource(role) or _is_preserved_infra_resource("ClusterRole", role):
                 continue
             logger.info(f"Deleting unexpected ClusterRole: {role}")
-            try:
-                self.rbac_v1.delete_cluster_role(name=role)
-                changes["cluster_roles_deleted"].append(role)
-            except ApiException as e:
-                if e.status != 404:
-                    logger.warning(f"Failed to delete ClusterRole {role}: {e}")
+
+            def _delete_cluster_role(role=role):
+                try:
+                    self.rbac_v1.delete_cluster_role(name=role)
+                except ApiException as e:
+                    if e.status != 404:
+                        logger.warning(f"Failed to delete ClusterRole {role}: {e}")
+                    return
+                sink.changed("cluster_roles_deleted", role)
+
+            sink.do("delete", f"clusterrole/{role}", "ClusterRole added since the baseline", _delete_cluster_role)
 
         # 3. Delete unexpected ClusterRoleBindings
         current_bindings = self._get_cluster_role_bindings()
@@ -334,24 +468,44 @@ class ClusterStateManager:
             if _is_chaos_mesh_resource(binding) or _is_preserved_infra_resource("ClusterRoleBinding", binding):
                 continue
             logger.info(f"Deleting unexpected ClusterRoleBinding: {binding}")
-            try:
-                self.rbac_v1.delete_cluster_role_binding(name=binding)
-                changes["cluster_role_bindings_deleted"].append(binding)
-            except ApiException as e:
-                if e.status != 404:
-                    logger.warning(f"Failed to delete ClusterRoleBinding {binding}: {e}")
+
+            def _delete_cluster_role_binding(binding=binding):
+                try:
+                    self.rbac_v1.delete_cluster_role_binding(name=binding)
+                except ApiException as e:
+                    if e.status != 404:
+                        logger.warning(f"Failed to delete ClusterRoleBinding {binding}: {e}")
+                    return
+                sink.changed("cluster_role_bindings_deleted", binding)
+
+            sink.do(
+                "delete",
+                f"clusterrolebinding/{binding}",
+                "ClusterRoleBinding added since the baseline",
+                _delete_cluster_role_binding,
+            )
 
         # 4. Delete unexpected PersistentVolumes
         current_pvs = self._get_persistent_volumes()
         unexpected_pvs = current_pvs - self.baseline.persistent_volumes
         for pv in unexpected_pvs:
             logger.info(f"Deleting unexpected PersistentVolume: {pv}")
-            try:
-                self.core_v1.delete_persistent_volume(name=pv)
-                changes["persistent_volumes_deleted"].append(pv)
-            except ApiException as e:
-                if e.status != 404:
-                    logger.warning(f"Failed to delete PersistentVolume {pv}: {e}")
+
+            def _delete_persistent_volume(pv=pv):
+                try:
+                    self.core_v1.delete_persistent_volume(name=pv)
+                except ApiException as e:
+                    if e.status != 404:
+                        logger.warning(f"Failed to delete PersistentVolume {pv}: {e}")
+                    return
+                sink.changed("persistent_volumes_deleted", pv)
+
+            sink.do(
+                "delete",
+                f"persistentvolume/{pv}",
+                "PersistentVolume added since the baseline",
+                _delete_persistent_volume,
+            )
 
         # 4b. Garbage-collect orphaned OpenEBS LocalPV hostpath dirs.
         # `openebs` is now protected (see PROTECTED_NAMESPACES), so the
@@ -360,14 +514,22 @@ class ClusterStateManager:
         # remains as a backstop: any /var/openebs/local/pvc-* dirs left behind
         # eventually fill the disk and break subsequent deploys.
         # Best-effort.
-        try:
-            gc_results = self.kubectl.gc_orphan_localpv_dirs()
-            total = sum(c for c in gc_results.values() if c > 0)
-            if total:
-                changes["localpv_dirs_gc"] = {"removed": total, "by_node": gc_results}
-                logger.info(f"[gc_localpv] Removed {total} orphan LocalPV dir(s) total")
-        except Exception as e:
-            logger.warning(f"Failed to GC orphan LocalPV dirs: {e}")
+        def _gc_orphan_localpv_dirs():
+            try:
+                gc_results = self.kubectl.gc_orphan_localpv_dirs()
+                total = sum(c for c in gc_results.values() if c > 0)
+                if total:
+                    sink.changed("localpv_dirs_gc", {"removed": total, "by_node": gc_results})
+                    logger.info(f"[gc_localpv] Removed {total} orphan LocalPV dir(s) total")
+            except Exception as e:
+                logger.warning(f"Failed to GC orphan LocalPV dirs: {e}")
+
+        sink.do(
+            "exec",
+            "node/* /var/openebs/local",
+            "sweeps orphaned LocalPV dirs with a privileged pod on every node",
+            _gc_orphan_localpv_dirs,
+        )
 
         # 5. Delete unexpected StorageClasses
         current_scs = self._get_storage_classes()
@@ -376,12 +538,17 @@ class ClusterStateManager:
             if _is_preserved_infra_resource("StorageClass", sc):
                 continue
             logger.info(f"Deleting unexpected StorageClass: {sc}")
-            try:
-                self.storage_v1.delete_storage_class(name=sc)
-                changes["storage_classes_deleted"].append(sc)
-            except ApiException as e:
-                if e.status != 404:
-                    logger.warning(f"Failed to delete StorageClass {sc}: {e}")
+
+            def _delete_storage_class(sc=sc):
+                try:
+                    self.storage_v1.delete_storage_class(name=sc)
+                except ApiException as e:
+                    if e.status != 404:
+                        logger.warning(f"Failed to delete StorageClass {sc}: {e}")
+                    return
+                sink.changed("storage_classes_deleted", sc)
+
+            sink.do("delete", f"storageclass/{sc}", "StorageClass added since the baseline", _delete_storage_class)
 
         # 6. Delete unexpected CRDs (strip finalizers from CRs first to prevent hanging)
         current_crds = self._get_crds()
@@ -390,13 +557,39 @@ class ClusterStateManager:
             if _is_chaos_mesh_resource(crd) or _is_preserved_infra_resource("CustomResourceDefinition", crd):
                 continue
             logger.info(f"Deleting unexpected CRD: {crd}")
-            self._strip_cr_finalizers(crd)
-            try:
-                self.apiextensions_v1.delete_custom_resource_definition(name=crd)
-                changes["crds_deleted"].append(crd)
-            except ApiException as e:
-                if e.status != 404:
-                    logger.warning(f"Failed to delete CRD {crd}: {e}")
+            for label, write in self._strip_cr_finalizers(crd):
+
+                def _strip_finalizers(label=label, write=write):
+                    try:
+                        write()
+                    except ApiException as e:
+                        if e.status != 404:
+                            logger.warning(f"Failed to strip finalizers from {label}: {e}")
+                        return
+                    logger.info(f"Stripped finalizers from {label}")
+
+                sink.do(
+                    "patch",
+                    f"customresource/{label}",
+                    "its finalizers would block the CRD delete",
+                    _strip_finalizers,
+                )
+
+            def _delete_custom_resource_definition(crd=crd):
+                try:
+                    self.apiextensions_v1.delete_custom_resource_definition(name=crd)
+                except ApiException as e:
+                    if e.status != 404:
+                        logger.warning(f"Failed to delete CRD {crd}: {e}")
+                    return
+                sink.changed("crds_deleted", crd)
+
+            sink.do(
+                "delete",
+                f"customresourcedefinition/{crd}",
+                "CRD added since the baseline",
+                _delete_custom_resource_definition,
+            )
 
         # 7. Delete unexpected ValidatingWebhookConfigurations
         current_vwc = self._get_validating_webhook_configs()
@@ -405,12 +598,22 @@ class ClusterStateManager:
             if _is_chaos_mesh_resource(vwc) or _is_preserved_infra_resource("ValidatingWebhookConfiguration", vwc):
                 continue
             logger.info(f"Deleting unexpected ValidatingWebhookConfiguration: {vwc}")
-            try:
-                self.admission_v1.delete_validating_webhook_configuration(name=vwc)
-                changes["validating_webhook_configs_deleted"].append(vwc)
-            except ApiException as e:
-                if e.status != 404:
-                    logger.warning(f"Failed to delete ValidatingWebhookConfiguration {vwc}: {e}")
+
+            def _delete_validating_webhook_configuration(vwc=vwc):
+                try:
+                    self.admission_v1.delete_validating_webhook_configuration(name=vwc)
+                except ApiException as e:
+                    if e.status != 404:
+                        logger.warning(f"Failed to delete ValidatingWebhookConfiguration {vwc}: {e}")
+                    return
+                sink.changed("validating_webhook_configs_deleted", vwc)
+
+            sink.do(
+                "delete",
+                f"validatingwebhookconfiguration/{vwc}",
+                "ValidatingWebhookConfiguration added since the baseline",
+                _delete_validating_webhook_configuration,
+            )
 
         # 8. Delete unexpected MutatingWebhookConfigurations
         current_mwc = self._get_mutating_webhook_configs()
@@ -419,27 +622,80 @@ class ClusterStateManager:
             if _is_chaos_mesh_resource(mwc) or _is_preserved_infra_resource("MutatingWebhookConfiguration", mwc):
                 continue
             logger.info(f"Deleting unexpected MutatingWebhookConfiguration: {mwc}")
-            try:
-                self.admission_v1.delete_mutating_webhook_configuration(name=mwc)
-                changes["mutating_webhook_configs_deleted"].append(mwc)
-            except ApiException as e:
-                if e.status != 404:
-                    logger.warning(f"Failed to delete MutatingWebhookConfiguration {mwc}: {e}")
+
+            def _delete_mutating_webhook_configuration(mwc=mwc):
+                try:
+                    self.admission_v1.delete_mutating_webhook_configuration(name=mwc)
+                except ApiException as e:
+                    if e.status != 404:
+                        logger.warning(f"Failed to delete MutatingWebhookConfiguration {mwc}: {e}")
+                    return
+                sink.changed("mutating_webhook_configs_deleted", mwc)
+
+            sink.do(
+                "delete",
+                f"mutatingwebhookconfiguration/{mwc}",
+                "MutatingWebhookConfiguration added since the baseline",
+                _delete_mutating_webhook_configuration,
+            )
 
         # 9. Reset node labels
-        changes["nodes_labels_reset"] = self._reconcile_node_labels()
+        for node_name, body, reset_line in self._reconcile_node_labels():
+
+            def _reset_node_labels(node_name=node_name, body=body, reset_line=reset_line):
+                try:
+                    self.core_v1.patch_node(name=node_name, body=body)
+                except ApiException as e:
+                    logger.warning(f"Failed to reconcile labels for node {node_name}: {e}")
+                    return
+                sink.changed("nodes_labels_reset", node_name)
+                logger.info(reset_line)
+
+            sink.do("patch", f"node/{node_name} labels", "labels differ from the baseline", _reset_node_labels)
 
         # 10. Reset node taints
-        changes["nodes_taints_reset"] = self._reconcile_node_taints()
+        for node_name, body in self._reconcile_node_taints():
+
+            def _reset_node_taints(node_name=node_name, body=body):
+                try:
+                    self.core_v1.patch_node(name=node_name, body=body)
+                except ApiException as e:
+                    logger.warning(f"Failed to reconcile taints for node {node_name}: {e}")
+                    return
+                sink.changed("nodes_taints_reset", node_name)
+                logger.info(f"Reset taints on node {node_name}")
+
+            sink.do("patch", f"node/{node_name} taints", "taints differ from the baseline", _reset_node_taints)
 
         # 11. Reset CoreDNS ConfigMap if modified
         if self._is_coredns_modified():
             logger.info("Resetting CoreDNS ConfigMap to baseline")
-            self._restore_coredns_configmap()
-            changes["coredns_reset"] = True
+            for namespace, data in self._restore_coredns_configmap():
 
-        logger.info(f"Reconciliation complete: {changes}")
-        return changes
+                def _restore_coredns_configmap(namespace=namespace, data=data):
+                    try:
+                        cm = self.core_v1.read_namespaced_config_map(name="coredns", namespace=namespace)
+                        cm.data = data
+                        self.core_v1.replace_namespaced_config_map(name="coredns", namespace=namespace, body=cm)
+                        # Restart CoreDNS pods to pick up the change
+                        self.kubectl.exec_command(
+                            "kubectl rollout restart deployment coredns -n kube-system 2>/dev/null || "
+                            "kubectl rollout restart daemonset coredns -n kube-system 2>/dev/null || true"
+                        )
+                        logger.info("CoreDNS ConfigMap restored to baseline")
+                    except ApiException as e:
+                        logger.error(f"Failed to restore CoreDNS ConfigMap: {e}")
+
+                sink.do(
+                    "replace",
+                    f"configmap/{namespace}/coredns",
+                    "CoreDNS data differs from the baseline; its pods restart too",
+                    _restore_coredns_configmap,
+                )
+            sink.changed("coredns_reset", True)
+
+        logger.info(f"Reconciliation complete: {sink.changes}")
+        return sink.changes
 
     def _get_cluster_uid(self) -> str:
         """Return an identity that changes whenever the Kubernetes cluster is recreated."""
@@ -504,22 +760,23 @@ class ClusterStateManager:
                 raise
             return set()
 
-    def _strip_cr_finalizers(self, crd_name: str):
-        """Remove finalizers from all custom resources of the given CRD.
+    def _strip_cr_finalizers(self, crd_name: str) -> list[tuple[str, Callable[[], None]]]:
+        """Return the finalizer strips needed on the custom resources of the given CRD.
 
-        This prevents CRD deletion from hanging when the controller that
-        handles the finalizers (e.g. chaos-mesh) is already gone.
+        Deleting a CRD hangs while the controller that handles the finalizers
+        (e.g. chaos-mesh) is already gone, so each custom resource loses them first.
+        Each entry is (log label, the patch call).
         """
         # Extract group and plural from CRD name (e.g. "networkchaos.chaos-mesh.org")
         parts = crd_name.split(".", 1)
         if len(parts) < 2:
-            return
+            return []
         plural, group = parts[0], parts[1]
 
         try:
             crd_obj = self.apiextensions_v1.read_custom_resource_definition(name=crd_name)
         except ApiException:
-            return
+            return []
 
         version = crd_obj.spec.versions[0].name if crd_obj.spec.versions else "v1alpha1"
         custom_api = client.CustomObjectsApi()
@@ -527,36 +784,37 @@ class ClusterStateManager:
         try:
             resources = custom_api.list_cluster_custom_object(group=group, version=version, plural=plural)
         except ApiException:
-            return
+            return []
 
+        strips = []
         for item in resources.get("items", []):
             finalizers = (item.get("metadata") or {}).get("finalizers")
             if not finalizers:
                 continue
             ns = item["metadata"].get("namespace")
             name = item["metadata"]["name"]
-            try:
-                if ns:
-                    custom_api.patch_namespaced_custom_object(
-                        group=group,
-                        version=version,
-                        namespace=ns,
-                        plural=plural,
-                        name=name,
-                        body={"metadata": {"finalizers": []}},
-                    )
-                else:
-                    custom_api.patch_cluster_custom_object(
-                        group=group,
-                        version=version,
-                        plural=plural,
-                        name=name,
-                        body={"metadata": {"finalizers": []}},
-                    )
-                logger.info(f"Stripped finalizers from {crd_name} CR {ns}/{name}")
-            except ApiException as e:
-                if e.status != 404:
-                    logger.warning(f"Failed to strip finalizers from {crd_name} CR {ns}/{name}: {e}")
+            if ns:
+                write = partial(
+                    custom_api.patch_namespaced_custom_object,
+                    group=group,
+                    version=version,
+                    namespace=ns,
+                    plural=plural,
+                    name=name,
+                    body={"metadata": {"finalizers": []}},
+                )
+            else:
+                write = partial(
+                    custom_api.patch_cluster_custom_object,
+                    group=group,
+                    version=version,
+                    plural=plural,
+                    name=name,
+                    body={"metadata": {"finalizers": []}},
+                )
+            strips.append((f"{crd_name} CR {ns}/{name}", write))
+
+        return strips
 
     def _get_crds(self, raise_on_error: bool = False) -> set[str]:
         """Get all CustomResourceDefinition names."""
@@ -652,34 +910,26 @@ class ClusterStateManager:
         current_data = self._get_coredns_configmap_data()
         return current_data != self.baseline.coredns_configmap_data
 
-    def _restore_coredns_configmap(self):
-        """Restore CoreDNS ConfigMap to baseline state."""
+    def _restore_coredns_configmap(self) -> list[tuple[str, dict]]:
+        """Return the CoreDNS ConfigMap writes needed to restore the baseline.
+
+        Each entry is (namespace, the data to replace the ConfigMap with).
+        """
         if not self.baseline or not self.baseline.coredns_configmap_data:
             logger.warning("No baseline CoreDNS data to restore")
-            return
+            return []
 
-        try:
-            cm = self.core_v1.read_namespaced_config_map(name="coredns", namespace="kube-system")
-            cm.data = self.baseline.coredns_configmap_data  # type: ignore[union-attr]
-            self.core_v1.replace_namespaced_config_map(name="coredns", namespace="kube-system", body=cm)
-            # Restart CoreDNS pods to pick up the change
-            self.kubectl.exec_command(
-                "kubectl rollout restart deployment coredns -n kube-system 2>/dev/null || "
-                "kubectl rollout restart daemonset coredns -n kube-system 2>/dev/null || true"
-            )
-            logger.info("CoreDNS ConfigMap restored to baseline")
-        except ApiException as e:
-            logger.error(f"Failed to restore CoreDNS ConfigMap: {e}")
+        return [("kube-system", self.baseline.coredns_configmap_data)]
 
-    def _reconcile_node_labels(self) -> list:
+    def _reconcile_node_labels(self) -> list[tuple[str, dict, str]]:
         """
-        Reconcile node labels to baseline state.
-        Returns list of nodes that were modified.
+        Return the node label patches needed to restore the baseline.
+        Each entry is (node name, the patch body, the line to log once it lands).
         """
         if not self.baseline:
             return []
 
-        modified_nodes = []
+        patches = []
         current_labels = self._get_node_labels()
 
         for node_name, baseline_labels in self.baseline.node_labels.items():
@@ -702,35 +952,31 @@ class ClusterStateManager:
             labels_to_restore = {k: v for k, v in baseline_labels.items() if k not in current or current[k] != v}
 
             if labels_to_remove or labels_to_restore:
-                try:
-                    # Build patch body
-                    patch_labels = {}
-                    for label in labels_to_remove:
-                        patch_labels[label] = None  # None removes the label
-                    for k, v in labels_to_restore.items():
-                        patch_labels[k] = v
+                # Build patch body
+                patch_labels = {}
+                for label in labels_to_remove:
+                    patch_labels[label] = None  # None removes the label
+                for k, v in labels_to_restore.items():
+                    patch_labels[k] = v
 
-                    body = {"metadata": {"labels": patch_labels}}
-                    self.core_v1.patch_node(name=node_name, body=body)
-                    modified_nodes.append(node_name)
-                    logger.info(
-                        f"Reset labels on node {node_name}: "
-                        f"removed={labels_to_remove}, restored={list(labels_to_restore.keys())}"
-                    )
-                except ApiException as e:
-                    logger.warning(f"Failed to reconcile labels for node {node_name}: {e}")
+                body = {"metadata": {"labels": patch_labels}}
+                reset_line = (
+                    f"Reset labels on node {node_name}: "
+                    f"removed={labels_to_remove}, restored={list(labels_to_restore.keys())}"
+                )
+                patches.append((node_name, body, reset_line))
 
-        return modified_nodes
+        return patches
 
-    def _reconcile_node_taints(self) -> list:
+    def _reconcile_node_taints(self) -> list[tuple[str, dict]]:
         """
-        Reconcile node taints to baseline state.
-        Returns list of nodes that were modified.
+        Return the node taint patches needed to restore the baseline.
+        Each entry is (node name, the patch body).
         """
         if not self.baseline:
             return []
 
-        modified_nodes = []
+        patches = []
         current_taints = self._get_node_taints()
 
         for node_name, baseline_taints in self.baseline.node_taints.items():
@@ -744,16 +990,11 @@ class ClusterStateManager:
             current_set = {json.dumps(t, sort_keys=True) for t in current}
 
             if baseline_set != current_set:
-                try:
-                    # Reconstruct taints from baseline
-                    taints = [
-                        client.V1Taint(key=t["key"], value=t.get("value"), effect=t["effect"]) for t in baseline_taints
-                    ]
-                    body = {"spec": {"taints": taints if taints else None}}
-                    self.core_v1.patch_node(name=node_name, body=body)
-                    modified_nodes.append(node_name)
-                    logger.info(f"Reset taints on node {node_name}")
-                except ApiException as e:
-                    logger.warning(f"Failed to reconcile taints for node {node_name}: {e}")
+                # Reconstruct taints from baseline
+                taints = [
+                    client.V1Taint(key=t["key"], value=t.get("value"), effect=t["effect"]) for t in baseline_taints
+                ]
+                body = {"spec": {"taints": taints if taints else None}}
+                patches.append((node_name, body))
 
-        return modified_nodes
+        return patches
