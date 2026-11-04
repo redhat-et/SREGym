@@ -110,6 +110,28 @@ def _http_endpoint(value: str) -> str:
     return value
 
 
+def campaign_abort_for_platform_refusal(error: BaseException, rows: list[dict]) -> "BenchmarkCampaignAborted":
+    """Return the abort that ends a campaign whose platform was refused.
+
+    The driver raises what this returns, so the decision and its payload have one home and a
+    test can check both without a cluster.
+    """
+    return BenchmarkCampaignAborted(platform_refusal_abort_reason(error), rows)
+
+
+def platform_refusal_abort_reason(error: BaseException) -> str:
+    """Return the one line a refused campaign stops with.
+
+    A platform refusal is a decision about the cluster, not a property of one problem. Letting
+    the campaign continue turns it into one `deploy_failed` row per problem and per attempt,
+    which reads like a broken benchmark rather than a wrong cluster.
+    """
+    return (
+        "The cluster does not confirm the declared platform, so the campaign stopped at the first "
+        f"problem instead of failing one problem at a time: {error}"
+    )
+
+
 class BenchmarkCampaignAborted(RuntimeError):
     """The campaign stopped safely after persisting its partial results."""
 
@@ -488,6 +510,7 @@ def driver_loop(
                 # A platform refusal says this cluster must not be touched at all, so the
                 # attempt ends without recovery or teardown.
                 cluster_untouched = False
+                platform_refusal: BaseException | None = None
                 for deploy_attempt in range(1, max_deploy_retries + 1):
                     check_interrupted()
                     try:
@@ -512,6 +535,7 @@ def driver_loop(
                                 "without retrying or cleaning up"
                             )
                             cluster_untouched = True
+                            platform_refusal = e
                             break
                         if deploy_attempt < max_deploy_retries:
                             console.log("🧹 Cleaning up before retry...")
@@ -577,6 +601,13 @@ def driver_loop(
                         raise BenchmarkCampaignAborted(
                             deploy_abort_reason,
                             [{agent_to_run: all_results_for_agent}],
+                        )
+                    if platform_refusal is not None:
+                        progress.stop()
+                        if not use_external_harness:
+                            conductor.stop_k8s_proxy()
+                        raise campaign_abort_for_platform_refusal(
+                            platform_refusal, [{agent_to_run: all_results_for_agent}]
                         )
                     console.log(f"⏭️  Skipping remaining attempts for '{pid}' and moving to next problem")
                     # Account for this attempt + remaining skipped attempts on the bar.
