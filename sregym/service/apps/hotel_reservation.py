@@ -1,4 +1,5 @@
 import contextlib
+import json
 import logging
 import shutil
 import tempfile
@@ -13,6 +14,7 @@ from sregym.paths import FAULT_SCRIPTS, HOTEL_RES_METADATA, TARGET_MICROSERVICES
 from sregym.service.apps.base import Application
 from sregym.service.apps.helpers import get_frontend_url
 from sregym.service.kubectl import KubeCtl
+from sregym.storage import uses_openebs
 
 logger = logging.getLogger("all.application")
 logger.propagate = True
@@ -22,6 +24,13 @@ HOTEL_RESERVATION_APPLICATION_IMAGE = (
     "ghcr.io/sregym/hotel-reservation:sha-d2c036bc3d1138f5a0bdaffd3d87f37522c3461a"
     "@sha256:1c685e1c4c304f327952397b3a99c54dadb086607774d71f222b200ec0d2e65e"
 )
+
+# A storage driver deletes the volume behind a PersistentVolume only after the claims
+# in the namespace are gone, and cleanup must not race it. Cleanup re-reads the PVs for
+# this long before it reports what the driver has not finished. It is small because it
+# runs once per problem, and bounded so a slow driver cannot hold up the next one.
+PV_RELEASE_WAIT_SECONDS = 10
+PV_RELEASE_POLL_SECONDS = 2
 
 
 class HotelReservation(Application):
@@ -219,21 +228,82 @@ class HotelReservation(Application):
         self.kubectl.delete_namespace(self.namespace)
 
         self.kubectl.wait_for_namespace_deletion(self.namespace)
-        pvs = self.kubectl.exec_command(
-            "kubectl get pv --no-headers | grep 'hotel-reservation' | awk '{print $1}'"
-        ).splitlines()
-
-        for pv in pvs:
-            # Check if the PV is in a 'Terminating' state and remove the finalizers if necessary
-            self._remove_pv_finalizers(pv)
-            delete_command = f"kubectl delete pv {pv}"
-            delete_result = self.kubectl.exec_command(delete_command)
-            logger.info(f"Deleted PersistentVolume {pv}: {delete_result.strip()}")
+        if uses_openebs():
+            # An OpenEBS LocalPV volume is reclaimed by a helper pod that can leave the
+            # PersistentVolume behind in 'Terminating' with its hostpath directory still
+            # in place, so remove the volumes this application's claims named: clear the
+            # finalizer the stuck volume waits on, then delete the volume.
+            for pv in self._namespace_persistent_volumes():
+                pv_name = pv.get("metadata", {}).get("name")
+                if not pv_name:
+                    continue
+                self._remove_pv_finalizers(pv_name)
+                delete_command = f"kubectl delete pv {pv_name}"
+                delete_result = self.kubectl.exec_command(delete_command)
+                logger.info(f"Deleted PersistentVolume {pv_name}: {delete_result.strip()}")
+        else:
+            # A CSI driver owns the whole lifecycle of its volume, so cleanup deletes
+            # nothing here; see _report_unreleased_persistent_volumes.
+            self._report_unreleased_persistent_volumes()
         time.sleep(5)
 
         if hasattr(self, "wrk"):
             # self.wrk.stop()
             self.kubectl.delete_job(label="job=workload", namespace=self.namespace)
+
+    def _namespace_persistent_volumes(self) -> list[dict]:
+        """Return the PersistentVolumes whose claim lives in this application's namespace.
+
+        The claim reference decides the match, not the volume name: a dynamically
+        provisioned volume is named ``pvc-<uid>``, so a name match finds nothing on a
+        cluster whose default class provisions them, and it can match a volume another
+        namespace or release owns.
+        """
+        raw = self.kubectl.exec_command("kubectl get pv -o json")
+        try:
+            pv_list = json.loads(raw)
+        except (TypeError, ValueError):
+            pv_list = None
+        if not isinstance(pv_list, dict):
+            logger.warning(f"Could not read the cluster's PersistentVolumes: {raw}")
+            return []
+        return [
+            pv
+            for pv in pv_list.get("items") or []
+            if (pv.get("spec", {}).get("claimRef") or {}).get("namespace") == self.namespace
+        ]
+
+    def _report_unreleased_persistent_volumes(self):
+        """Name the PersistentVolumes the storage driver has not finished deleting.
+
+        Removing a PersistentVolume, or clearing its finalizers, before the CSI
+        controller confirms the backend volume is gone deletes the record of the volume
+        while the volume itself stays behind, so nothing is deleted or patched here.
+        """
+        deadline = time.monotonic() + PV_RELEASE_WAIT_SECONDS
+        remaining = self._namespace_persistent_volumes()
+        while remaining and time.monotonic() < deadline:
+            time.sleep(PV_RELEASE_POLL_SECONDS)
+            remaining = self._namespace_persistent_volumes()
+
+        for pv in remaining:
+            logger.warning(
+                f"PersistentVolume {pv.get('metadata', {}).get('name', '<unnamed>')} "
+                f"(phase {pv.get('status', {}).get('phase', 'Unknown')}, "
+                f"volumeHandle {self._csi_volume_handle(pv)}) still exists after namespace "
+                f"{self.namespace} was deleted; the CSI driver owns its deletion"
+            )
+        if remaining:
+            logger.warning(
+                f"{len(remaining)} PersistentVolume(s) claimed by namespace {self.namespace} were not released "
+                f"within {PV_RELEASE_WAIT_SECONDS}s and are left to the CSI driver"
+            )
+
+    @staticmethod
+    def _csi_volume_handle(pv: dict) -> str:
+        """Return the CSI driver's handle for the volume, or 'n/a' when the PV has no CSI block."""
+        csi = pv.get("spec", {}).get("csi") or {}
+        return csi.get("volumeHandle") or "n/a"
 
     def _remove_pv_finalizers(self, pv_name: str):
         """Remove finalizers from the PersistentVolume to prevent it from being stuck in a 'Terminating' state."""
