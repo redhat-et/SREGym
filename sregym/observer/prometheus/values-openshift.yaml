@@ -1,0 +1,45 @@
+# Prometheus values overlay for OpenShift.
+#
+# The vendored chart pins its workloads to
+# `node-role.kubernetes.io/control-plane: ""` and tolerates that taint, because
+# the `kind` cluster has one node and it is the control plane. On a managed
+# cluster the control-plane nodes are tainted, managed by the platform and not
+# SREGym's to schedule onto, so the pins are removed here.
+#
+# The pins are removed with `nodeSelector: null`, that is the whole map, and not
+# with `nodeSelector: {node-role.kubernetes.io/control-plane: null}`. Helm
+# coalesces maps: a per-key `null` is kept as a null *value* for that key and
+# renders `nodeSelector: {node-role.kubernetes.io/control-plane: null}`, which
+# the API server rejects. Only a null for the whole map deletes it. A list is
+# replaced wholesale, so `tolerations: []` drops the taint toleration.
+#
+# The component keys are the chart's own top-level scopes. `pushgateway` and
+# `blackbox-exporter` are not keys and would be ignored silently.
+server:
+  nodeSelector: null
+  tolerations: []
+
+alertmanager:
+  nodeSelector: null
+  tolerations: []
+
+kube-state-metrics:
+  nodeSelector: null
+  tolerations: []
+
+prometheus-pushgateway:
+  nodeSelector: null
+  tolerations: []
+
+# `enabled: false` has no effect here: this subchart is vendored under charts/ but
+# is not declared in the chart's Chart.yaml dependencies, so it has no condition.
+# Removing its node selector is what keeps it schedulable.
+prometheus-blackbox-exporter:
+  nodeSelector: null
+  tolerations: []
+
+# One pod per node, on a node the platform manages. This subchart does honour
+# `enabled`, so it is switched off outright. Whether its port collides with the
+# platform's own node exporter is unverified; no node is available here to check.
+prometheus-node-exporter:
+  enabled: false

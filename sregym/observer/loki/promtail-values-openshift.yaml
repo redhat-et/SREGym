@@ -1,0 +1,14 @@
+# Promtail values overlay for OpenShift.
+#
+# The chart's default tolerations tolerate the control-plane taint, which on a
+# managed cluster would place a DaemonSet pod on a node that is not SREGym's.
+# Emptying the list drops that toleration. Whether that pod is also privileged, and
+# cannot be admitted under the restricted SCCs, is unverified; no OpenShift node is
+# available here to check.
+tolerations: []
+
+# Pushes to the `loki` Service rather than the disabled gateway; see
+# values-openshift.yaml in this directory for why the gateway is off.
+config:
+  clients:
+    - url: http://loki.observe.svc.cluster.local:3100

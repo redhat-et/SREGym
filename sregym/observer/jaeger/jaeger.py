@@ -3,6 +3,8 @@ import subprocess
 import time
 from pathlib import Path
 
+from sregym.service.pod_scheduling import kubectl_apply_command
+
 logger = logging.getLogger("all.sregym.jaeger")
 
 
@@ -21,7 +23,7 @@ class Jaeger:
     def deploy(self):
         """Deploy Jaeger to the observe namespace."""
         self._ensure_namespace_ready()
-        self.run_cmd(f"kubectl apply -f {self.config_file} -n {self.namespace}")
+        self.run_cmd(kubectl_apply_command(self.config_file, self.namespace))
         self.wait_for_service("jaeger-out", timeout=120)
         logger.info("Jaeger deployed successfully.")
 

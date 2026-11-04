@@ -4,6 +4,7 @@ import subprocess
 import time
 from pathlib import Path
 
+from sregym.service.pod_scheduling import kubectl_apply_command
 from sregym.service.rollout import deployment_rollout_complete
 
 logger = logging.getLogger("all.sregym.otel_collector")
@@ -24,7 +25,7 @@ class OtelCollector:
     def deploy(self):
         """Deploy OTel Collector with spanmetrics connector."""
         self._create_jaeger_backend_service()
-        self.run_cmd(f"kubectl apply -f {self.config_file} -n {self.namespace}")
+        self.run_cmd(kubectl_apply_command(self.config_file, self.namespace))
         self._wait_for_ready(timeout=120)
         logger.info("OTel Collector deployed successfully.")
 

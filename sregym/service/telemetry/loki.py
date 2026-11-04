@@ -2,6 +2,7 @@ import json
 import logging
 import subprocess
 
+from sregym.cluster_platform import is_openshift
 from sregym.paths import BASE_DIR, LOKI_METADATA
 from sregym.service.helm import Helm
 from sregym.service.kubectl import KubeCtl
@@ -100,14 +101,18 @@ class Loki:
     def _requested_helm_configs(self) -> dict:
         """The Helm config of this deployment: the metadata config plus the requested class."""
         helm_configs = dict(self.helm_configs)
+        extra_args = list(helm_configs.get("extra_args", []))
+        if is_openshift():
+            # The overlay carries the node pins and the gateway, so a platform
+            # switch changes the fingerprint and forces the redeploy.
+            extra_args += ["-f", str(BASE_DIR / "observer/loki/values-openshift.yaml")]
+            self.logger.info("[openshift] Dropping the control-plane node pins and the gateway")
         if not uses_openebs():
             # The vendored values file names openebs-hostpath, which is the `kind`
             # render input. Any other class is passed over it, unchanged.
-            helm_configs["extra_args"] = [
-                *helm_configs.get("extra_args", []),
-                "--set-string",
-                f"singleBinary.persistence.storageClass={get_storage_class()}",
-            ]
+            extra_args += ["--set-string", f"singleBinary.persistence.storageClass={get_storage_class()}"]
+        if extra_args:
+            helm_configs["extra_args"] = extra_args
         return helm_configs
 
     def _delete_retained_pvcs(self) -> None:
@@ -152,12 +157,15 @@ class Loki:
 
     def _promtail_helm_configs(self) -> dict:
         """The Helm config of this deployment: the Promtail chart and its values file."""
+        extra_args = ["-f", self.promtail_values_file]
+        if is_openshift():
+            extra_args += ["-f", str(BASE_DIR / "observer/loki/promtail-values-openshift.yaml")]
         return {
             "release_name": self.promtail_release_name,
             "chart_path": "grafana/promtail",
             "namespace": self.namespace,
             "remote_chart": True,
-            "extra_args": ["-f", self.promtail_values_file],
+            "extra_args": extra_args,
         }
 
     def _is_promtail_running(self) -> bool:

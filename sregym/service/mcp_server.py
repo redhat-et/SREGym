@@ -9,9 +9,11 @@ import time
 import requests
 import yaml
 
+from sregym.cluster_platform import is_openshift
 from sregym.paths import MCP_SERVER_K8S
 from sregym.service.kubectl import WAIT_FOR_POD_READY_TIMEOUT, KubeCtl
 from sregym.service.kubernetes_access_policy import restricted_cluster_role
+from sregym.service.pod_scheduling import without_node_pins
 from sregym.service.rollout import deployment_rollout_complete
 
 logger = logging.getLogger("all.sregym.mcp_server")
@@ -59,6 +61,10 @@ class MCPServer:
         """Configure the rendered manifests before any resource is applied."""
         rendered = self.kubectl.exec_command_checked(f"kubectl kustomize {MCP_SERVER_K8S}", timeout=30)
         resources = [body for body in yaml.safe_load_all(rendered) if body]
+        if is_openshift():
+            # The Deployment pins the control-plane node, which on a managed cluster
+            # is tainted and not SREGym's to schedule onto.
+            resources = without_node_pins(resources)
         for index, body in enumerate(resources):
             if body["kind"] == "ClusterRole" and self.restrict_network_access:
                 resources[index] = restricted_cluster_role(body)

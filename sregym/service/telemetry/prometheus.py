@@ -2,6 +2,7 @@ import json
 import logging
 import subprocess
 
+from sregym.cluster_platform import is_openshift
 from sregym.paths import BASE_DIR, PROMETHEUS_METADATA
 from sregym.profile import is_svelte
 from sregym.service.helm import Helm
@@ -88,6 +89,10 @@ class Prometheus:
             svelte_values = BASE_DIR / "observer" / "prometheus" / "values-svelte.yaml"
             extra_args += ["-f", str(svelte_values)]
             self.logger.info("[svelte] Dropping Alertmanager and Pushgateway; retention 15d -> 2h")
+        if is_openshift():
+            openshift_values = BASE_DIR / "observer" / "prometheus" / "values-openshift.yaml"
+            extra_args += ["-f", str(openshift_values)]
+            self.logger.info("[openshift] Dropping the control-plane node pins and node-exporter")
         if not uses_openebs():
             # The vendored values file names openebs-hostpath, which is the `kind`
             # render input. Any other class is passed over it, unchanged.

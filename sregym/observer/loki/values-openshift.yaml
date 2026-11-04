@@ -1,0 +1,28 @@
+# Loki values overlay for OpenShift.
+#
+# Same node-pinning rule as the Prometheus overlay: the vendored values pin
+# `singleBinary` and `gateway` to the control-plane node and tolerate its taint,
+# which is right on a single-node `kind` cluster and wrong on a managed one. The
+# pins go with `nodeSelector: null`, the whole map, because a per-key `null`
+# renders a null value instead of deleting the key. `tolerations: []` replaces
+# the list wholesale.
+singleBinary:
+  nodeSelector: null
+  tolerations: []
+
+# The gateway is the push endpoint. Its chart hardcodes
+# `resolver kube-dns.kube-system.svc.cluster.local.`, and OpenShift serves DNS
+# from `openshift-dns`, so the gateway cannot resolve Loki there. Promtail pushes
+# to the `loki` Service instead, and every reader (Grafana, the MCP Loki tools)
+# already uses it, so the gateway is switched off. The node settings below are
+# inert once it is disabled and are kept only so the file states the intent.
+gateway:
+  enabled: false
+  nodeSelector: null
+  tolerations: []
+
+# Promtail pushes to the `loki` Service, not the disabled gateway.
+promtail:
+  config:
+    clients:
+      - url: http://loki.observe.svc.cluster.local:3100
