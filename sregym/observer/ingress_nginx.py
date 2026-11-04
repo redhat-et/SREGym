@@ -5,6 +5,7 @@ import shlex
 import subprocess
 import time
 
+from sregym.service.kubectl import WAIT_FOR_POD_READY_TIMEOUT
 from sregym.service.rollout import deployment_rollout_complete
 
 logger = logging.getLogger("all.sregym.ingress_nginx")
@@ -36,7 +37,7 @@ class IngressNginx:
             "--set controller.ingressClassResource.default=true "
             "--set controller.watchIngressWithoutClass=true"
         )
-        self._wait_for_ready(timeout=120)
+        self._wait_for_ready()
         logger.info("Nginx ingress controller deployed successfully.")
 
     def _remove_orphaned_cluster_objects(self) -> None:
@@ -104,7 +105,7 @@ class IngressNginx:
                     )
                 )
 
-    def _wait_for_ready(self, timeout: int = 120):
+    def _wait_for_ready(self, timeout: int = WAIT_FOR_POD_READY_TIMEOUT):
         """Wait until the ingress controller deployment is ready."""
         t0 = time.time()
         while time.time() - t0 < timeout:

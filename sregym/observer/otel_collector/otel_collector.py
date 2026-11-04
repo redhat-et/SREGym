@@ -4,6 +4,7 @@ import subprocess
 import time
 from pathlib import Path
 
+from sregym.service.kubectl import WAIT_FOR_POD_READY_TIMEOUT
 from sregym.service.pod_scheduling import kubectl_apply_command
 from sregym.service.rollout import deployment_rollout_complete
 
@@ -26,7 +27,7 @@ class OtelCollector:
         """Deploy OTel Collector with spanmetrics connector."""
         self._create_jaeger_backend_service()
         self.run_cmd(kubectl_apply_command(self.config_file, self.namespace))
-        self._wait_for_ready(timeout=120)
+        self._wait_for_ready()
         logger.info("OTel Collector deployed successfully.")
 
     def _create_jaeger_backend_service(self):
@@ -45,7 +46,7 @@ class OtelCollector:
         )
         self.run_cmd(f"echo '{manifest}' | kubectl apply -f -")
 
-    def _wait_for_ready(self, timeout: int = 120):
+    def _wait_for_ready(self, timeout: int = WAIT_FOR_POD_READY_TIMEOUT):
         """Wait until the OTel Collector pod is ready."""
         t0 = time.time()
         while time.time() - t0 < timeout:
