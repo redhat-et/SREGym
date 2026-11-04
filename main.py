@@ -27,8 +27,21 @@ from clients.jev.config import configure as configure_jev
 from logger import console, init_logger
 from sregym.agent_launcher import AgentLauncher
 from sregym.agent_registry import get_agent, list_agents
-from sregym.cluster_platform import KIND, PLATFORMS, PlatformVerificationError, set_platform
-from sregym.conductor.conductor import ALL_STAGES, Conductor, ConductorConfig, reconcile_refusal
+from sregym.cluster_platform import (
+    KIND,
+    PLATFORMS,
+    PlatformVerificationError,
+    get_platform,
+    is_openshift,
+    set_platform,
+)
+from sregym.conductor.conductor import (
+    ALL_STAGES,
+    FILTERED_INTERNET_UNAVAILABLE,
+    Conductor,
+    ConductorConfig,
+    reconcile_refusal,
+)
 from sregym.conductor.conductor_api import request_shutdown, run_api
 from sregym.conductor.problem_sets import PROBLEM_SETS
 from sregym.phases import read_ledger as read_phase_ledger
@@ -60,6 +73,9 @@ AGENT_REAP_GRACE_SECONDS = 60
 # watchdog long enough for those bounded steps to finish and allow slower hosts
 # to raise it without editing the benchmark runner.
 CLEANUP_DRAIN_TIMEOUT_SECONDS = float(os.environ.get("SREGYM_CLEANUP_DRAIN_TIMEOUT_S", "600"))
+# The agent registry every entry point reads. One spelling, so the refusal and the
+# launch cannot disagree about which file names the agents.
+AGENTS_YAML = Path(os.path.dirname(os.path.abspath(__file__))) / "agents.yaml"
 
 
 def problem_cleanup_timeout(conductor) -> float:
@@ -256,6 +272,7 @@ def driver_loop(
     agent_timeout: int = 1800,
     resume_csv: str | None = None,
     judge_backend: str = "api",
+    internet_access: str = "filtered",
     stop_event: threading.Event | None = None,
 ):
     """
@@ -299,7 +316,7 @@ def driver_loop(
             # so do not let stale local-run state affect them.
             conductor.clear_cluster_egress_boundary()
         else:
-            agents = list_agents(path=Path(os.path.dirname(os.path.abspath(__file__))) / "agents.yaml")
+            agents = list_agents(path=AGENTS_YAML)
             if agent_to_run not in agents:
                 console.log(f"⚠️ Agent '{agent_to_run}' not found in registry. Available agents: {list(agents)}")
                 sys.exit(1)
@@ -447,6 +464,12 @@ def driver_loop(
                 # interpretable next to the log that produced it. Read from the
                 # environment, where _configure_model_environment already put
                 # them, so agent and judge cannot drift apart.
+                #
+                # The internet-access mode is recorded for the same reason, and it is
+                # deliberately not a result column: per-attempt headers are compared
+                # between runs, and an open run isolates less than a filtered one, so a
+                # result whose mode is unrecorded cannot be told apart from a filtered
+                # one.
                 phases_path = Path(base_dir) / (agent_to_run or "agent") / pid / f"phases_attempt{attempt}.jsonl"
                 conductor.bind_phase_ledger(
                     phases_path,
@@ -455,6 +478,7 @@ def driver_loop(
                     model=os.environ.get("AGENT_MODEL_ID"),
                     judge_model=os.environ.get("JUDGE_MODEL_ID"),
                     judge_backend=judge_backend,
+                    internet_access=internet_access,
                 )
 
                 # Retry start_problem up to 3 times to handle transient deploy failures
@@ -583,7 +607,7 @@ def driver_loop(
                     with _artifact_environment(run):
                         reg = get_agent(
                             agent_to_run,
-                            path=Path(os.path.dirname(os.path.abspath(__file__))) / "agents.yaml",
+                            path=AGENTS_YAML,
                         )
                         if reg:
                             check_interrupted()
@@ -886,6 +910,7 @@ def _run_driver_and_shutdown(
     agent_timeout: int = 1800,
     resume_csv: str | None = None,
     judge_backend: str = "api",
+    internet_access: str = "filtered",
     stop_event: threading.Event | None = None,
 ):
     """Run the benchmark driver, stash results, then tell the API to exit."""
@@ -900,6 +925,7 @@ def _run_driver_and_shutdown(
             agent_timeout=agent_timeout,
             resume_csv=resume_csv,
             judge_backend=judge_backend,
+            internet_access=internet_access,
             stop_event=stop_event,
         )
         _driver_results = results
@@ -918,6 +944,35 @@ def _run_driver_and_shutdown(
             # recovery starts. The main thread must not tear down concurrently.
             cleanup_interrupted_problem(conductor)
         request_shutdown()
+
+
+def internet_access_refusal(policy: InternetPolicy, agent_name: str | None = None) -> str | None:
+    """Return the one-line refusal for filtered internet access here, or None.
+
+    Filtered access is a Calico feature: the boundary is a GlobalNetworkPolicy in the
+    adminnetworkpolicy tier, and OpenShift runs OVN-Kubernetes, which has no such tier.
+    The run therefore stops at argument resolution, before the Docker egress proxy is
+    built, instead of failing inside the conductor with a Calico capability message.
+
+    ``cluster_access: false`` is served only under that boundary, so an agent
+    registered that way has no valid mode on this platform: ``open`` withholds
+    nothing, and the container runner refuses it. That agent is named as unusable
+    rather than told to re-run with a flag that would fail too.
+    """
+    if not (policy.is_filtered and is_openshift()):
+        return None
+    registration = get_agent(agent_name, path=AGENTS_YAML) if agent_name else None
+    if registration is not None and not registration.cluster_access:
+        return (
+            f"Refusing agent '{registration.name}' on openshift: it sets cluster_access: false, which only the "
+            f"filtered egress boundary provides. {FILTERED_INTERNET_UNAVAILABLE}, so this agent has no valid mode "
+            "here. Run a different agent."
+        )
+    return (
+        f"Refusing --internet-access filtered on openshift: {FILTERED_INTERNET_UNAVAILABLE}, so the egress "
+        "boundary cannot be built. Re-run with --internet-access open. That is a weaker isolation guarantee: a "
+        "result from this platform is not comparable with a kind result on isolation grounds."
+    )
 
 
 def main(args):
@@ -955,6 +1010,14 @@ def _run_benchmark(args, *, judge_backend: str = "api", agent_image: str | None 
         model_id=agent_model,
         additional_allowed_endpoints=getattr(args, "allow_agent_endpoint", ()),
     )
+    # The policy decides whether an isolation boundary is built at all, so it is refused
+    # here, before container isolation and the agent's preflight install anything. An
+    # external-harness run starts no proxy and runs no agent, so it never builds the
+    # boundary and is not refused for lacking one.
+    if not getattr(args, "use_external_harness", False):
+        internet_refusal = internet_access_refusal(internet_policy, args.agent)
+        if internet_refusal:
+            sys.exit(internet_refusal)
     harden_container = args.container_hardening == "on"
 
     set_profile(args.profile)
@@ -978,17 +1041,14 @@ def _run_benchmark(args, *, judge_backend: str = "api", agent_image: str | None 
         f"reasoning_effort: {getattr(args, 'reasoning_effort', None) or 'agent default'}, "
         f"jev_model: {getattr(args, 'jev_model', None) or 'disabled'}, "
         f"deployment_profile: {get_profile()}, "
+        f"platform: {get_platform()}, "
         f"internet_access: {internet_policy.mode.value}, "
         f"container_hardening: {args.container_hardening}, "
         f"agent_api_base: {_env_status('AGENT_API_BASE')}, judge_api_base: {_env_status('JUDGE_API_BASE')}"
     )
 
     # Only build/check agent container image if the agent requires it
-    agent_reg = (
-        get_agent(args.agent, path=Path(os.path.dirname(os.path.abspath(__file__))) / "agents.yaml")
-        if args.agent
-        else None
-    )
+    agent_reg = get_agent(args.agent, path=AGENTS_YAML) if args.agent else None
     if (
         internet_policy.is_filtered
         and not args.use_external_harness
@@ -1067,7 +1127,11 @@ def _run_benchmark(args, *, judge_backend: str = "api", agent_image: str | None 
             args.resume,
         ),
         name="driver",
-        kwargs={"judge_backend": judge_backend, "stop_event": stop_event},
+        kwargs={
+            "judge_backend": judge_backend,
+            "internet_access": internet_policy.mode.value,
+            "stop_event": stop_event,
+        },
         daemon=True,
     )
     driver_thread.start()

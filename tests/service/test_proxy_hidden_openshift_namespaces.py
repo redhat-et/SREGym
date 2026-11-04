@@ -76,7 +76,11 @@ def test_openshift_without_a_readable_namespace_list_refuses_to_start_the_proxy(
 
     conductor.k8s_proxy.start.assert_not_called()
     assert conductor.k8s_proxy.hidden_namespaces == set(HIDDEN_NAMESPACES)
-    assert conductor.cluster_egress.stop.called
+    # OpenShift never has a boundary to remove, and the delete raises 403 under a
+    # restricted identity, so the failure path skips it. The kind counterpart (the
+    # boundary is cleared on both the open path and this failure path) is asserted in
+    # tests/test_internet_policy_platform.py.
+    conductor.cluster_egress.stop.assert_not_called()
 
 
 def test_openshift_with_a_failing_namespace_read_refuses_to_start_the_proxy(monkeypatch):

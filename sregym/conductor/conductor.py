@@ -67,6 +67,14 @@ from sregym.storage import OPENebs, get_storage_class, uses_openebs
 # exists.
 ALL_STAGES = ("diagnosis", "mitigation")
 
+# Why a filtered internet policy cannot be served here. Stated once, because two
+# entry points answer for it: main.py refuses the run at argument resolution, and
+# start_k8s_proxy refuses it again for a Conductor built elsewhere.
+FILTERED_INTERNET_UNAVAILABLE = (
+    "filtered internet access needs Calico 3.29 or later with the adminnetworkpolicy tier, and this "
+    "platform runs OVN-Kubernetes"
+)
+
 
 def resolve_reconcile_mode(requested: str | None) -> str:
     """Return the reconcile mode to use, with the platform default when none was requested.
@@ -228,18 +236,44 @@ class Conductor:
         """
         self.logger.info("Starting Kubernetes API filtering proxy...")
         if self.config.internet_policy.is_filtered:
+            if is_openshift():
+                # Backstop only: main.py refuses this before any container work, so the
+                # run reaching this line built its own Conductor. The boundary is a
+                # Calico policy in the adminnetworkpolicy tier, which this platform has
+                # no tier for, so start() could only fail here.
+                raise RuntimeError(
+                    f"{FILTERED_INTERNET_UNAVAILABLE}, so the cluster egress boundary cannot be built. "
+                    "Re-run with --internet-access open."
+                )
             self.cluster_egress.start()
         else:
-            self.cluster_egress.stop()
+            self._stop_cluster_egress()
         try:
             if is_openshift():
                 self._hide_platform_namespaces()
             self.k8s_proxy.start()
             self._agent_kubeconfig_path = self.k8s_proxy.generate_agent_kubeconfig()
         except BaseException:
-            self.cluster_egress.stop()
+            self._stop_cluster_egress()
             raise
         self.logger.info(f"Agent kubeconfig generated at: {self._agent_kubeconfig_path}")
+
+    def _stop_cluster_egress(self) -> None:
+        """Remove the cluster egress boundary, on the platforms that can have one.
+
+        A filtered run creates the boundary, and an interrupted one can leave it
+        behind, so an open run clears it before the proxy starts and again if the
+        proxy fails to start.
+
+        OpenShift never has one to clear: the boundary is a Calico policy this
+        platform cannot create, and under a restricted identity the delete comes back
+        403 rather than the tolerated 404, which ``stop()`` raises. Skipping the call
+        is this platform's answer, not a swallowed error.
+        """
+        if is_openshift():
+            self.logger.debug("Platform openshift has no cluster egress boundary to remove; skipping its removal")
+            return
+        self.cluster_egress.stop()
 
     def _hide_platform_namespaces(self) -> None:
         """Add the platform's own namespaces to what the proxy hides from the agent.
