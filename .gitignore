@@ -219,6 +219,9 @@ provisioner_ssh_key
 provisioner_ssh_key.pub
 agent_graph.png
 
+# One-off node inspection output from a run; never a source file.
+result_debug.txt
+
 # Ignore tasklist
 sregym/conductor/tasklist.yml
 
@@ -251,3 +254,6 @@ logs/
 docker/agents/build-context/
 
 resolve-values.yaml
+
+# OpenShift compatibility working notes (plan, readiness report, tracker). Never committed.
+.openshift-compatibility/
