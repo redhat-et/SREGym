@@ -41,7 +41,7 @@ from sregym.generators.fault.inject_virtual import VirtualizationFaultInjector
 from sregym.generators.noise.manager import get_noise_manager
 from sregym.observer.jaeger import Jaeger
 from sregym.observer.otel_collector import OtelCollector
-from sregym.paths import CLUSTER_BASELINE_STATE_FILE
+from sregym.paths import BASE_DIR, CLUSTER_BASELINE_STATE_FILE
 from sregym.phases import PhaseLedger
 from sregym.profile import is_svelte
 from sregym.service.admission_preflight import MISSING, check_scc_grant, grant_commands
@@ -55,6 +55,8 @@ from sregym.service.cluster_state import (
     RECONCILE_REPORT,
     ClusterStateManager,
 )
+from sregym.service.image_preflight import find_unqualified
+from sregym.service.image_preflight import report as format_image_report
 from sregym.service.internet_policy import InternetPolicy
 from sregym.service.k8s_proxy import KubernetesAPIProxy
 from sregym.service.kubectl import WAIT_FOR_POD_READY_TIMEOUT, KubeCtl
@@ -128,6 +130,10 @@ class ConductorConfig:
     # platform decides, which cannot be a dataclass default because that would call
     # get_platform() at import time.
     reconcile: str | None = None
+    # An operator assertion that the cluster resolves the unqualified image names in the
+    # manifests it is about to apply. The preflight cannot know a cluster's short-name table,
+    # so it refuses; this says "I know this one, proceed" and every finding is still logged.
+    allow_unqualified_images: bool = False
 
     @property
     def restrict_network_access(self) -> bool:
@@ -354,6 +360,39 @@ class Conductor:
         # cluster_platform module predicates, never by reading this attribute.
         self.platform = verify_platform_matches_cluster(self.kubectl.openshift_api_present, log=self.logger)
         self._platform_verified = True
+
+    def _verify_image_references(self, problem) -> None:
+        """Refuse a run whose manifests name images the cluster may rewrite.
+
+        A managed cluster resolves an unqualified image name through its own short-name
+        alias table before pulling, so the name in the manifest is not the image that is
+        pulled. The failure then arrives as `ImagePullBackOff` on eight pods and a 600 s
+        readiness timeout, which reads like an application fault. This happens before the
+        application deploy, so it costs one line instead.
+
+        The scan covers the manifests SREGym applies itself and the application's own
+        manifest directory. Chart templates are skipped: they are YAML only after
+        rendering, and the summary the operator needs is the manifest path.
+        """
+        if not is_openshift():
+            return
+        paths = [BASE_DIR / "observer"]
+        app_path = getattr(problem.app, "k8s_deploy_path", None)
+        if app_path:
+            paths.append(Path(app_path))
+        findings = find_unqualified(paths)
+        if not findings:
+            self.logger.info("[DEPLOY] Every scanned image reference names its registry")
+            return
+        message = format_image_report(findings)
+        if getattr(getattr(self, "config", None), "allow_unqualified_images", False):
+            self.logger.warning(
+                f"[DEPLOY] {message} Continuing because --allow-unqualified-images was given: "
+                "the operator asserts this cluster resolves these names."
+            )
+            return
+        self.logger.error(f"[DEPLOY] {message}")
+        raise RuntimeError(message)
 
     def _verify_scc_grant(self) -> None:
         """Make the `anyuid` SCC prerequisite visible before the first destructive step.
@@ -1785,6 +1824,7 @@ class Conductor:
                 self.jaeger.create_external_name_service(ns)
 
         self.logger.info("[DEPLOY] Deploying and starting workload")
+        self._verify_image_references(problem)
         problem.app.deploy()
         self.logger.info(f"[ENV] Deploy application: {problem.app.name}")
 

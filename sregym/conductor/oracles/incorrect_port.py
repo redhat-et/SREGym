@@ -76,7 +76,7 @@ class IncorrectPortAssignmentMitigationOracle(Oracle):
         """
         if getattr(self.problem, "tcp_dependency_probe", False):
             host, _, port = address.rpartition(":")
-            return {"image": "busybox:1.36", "command": ["sh", "-c", f"nc -z -w 10 '{host}' {port}"]}
+            return {"image": "docker.io/busybox:1.36", "command": ["sh", "-c", f"nc -z -w 10 '{host}' {port}"]}
         return {
             "image": self.probe_image,
             "args": ["-plaintext", "-max-time", "10", "-d", "{}", address, self.probe_rpc],

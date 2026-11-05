@@ -64,7 +64,7 @@ class StaleHostAliasesMitigationOracle(MitigationOracle):
     probe_timeout_seconds = 90
     poll_interval_seconds = 2
     request_timeout_seconds = 5
-    probe_image = "busybox:1.36"
+    probe_image = "docker.io/busybox:1.36"
     edge_service = "frontend-proxy"
     product_path = "/api/products"
     expected_product_id = "OLJCESPC7Z"

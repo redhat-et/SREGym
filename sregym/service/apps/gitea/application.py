@@ -174,7 +174,7 @@ class GiteaApplication(KubernetesCommands, Application):
                     "containers": [
                         {
                             "name": "client",
-                            "image": "python:3.12-alpine",
+                            "image": "docker.io/python:3.12-alpine",
                             "command": ["sleep", "infinity"],
                             "volumeMounts": [{"name": "credentials", "mountPath": "/credentials", "readOnly": True}],
                             "resources": {"requests": {"cpu": "10m", "memory": "32Mi"}, "limits": {"memory": "128Mi"}},

@@ -56,7 +56,7 @@ logger = logging.getLogger(__name__)
 # Probe pod
 _PROBE_TIMEOUT_S = 90
 _PROBE_POLL_INTERVAL = 3
-_PROBE_IMAGE = "busybox:1.36"
+_PROBE_IMAGE = "docker.io/busybox:1.36"
 
 
 class CumulativeAdmissionWebhookTimeoutMitigationOracle(MitigationOracle):

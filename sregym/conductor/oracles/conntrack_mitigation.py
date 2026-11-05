@@ -56,7 +56,7 @@ def _run_node_check_pod(kubectl, node_name: str, namespace: str, command: str, *
     pod_name = f"node-healthcheck-{int(time.time() * 1000)}"
     container = {
         "name": "check",
-        "image": "busybox:1.36",
+        "image": "docker.io/busybox:1.36",
         "command": ["sh", "-c", command],
     }
     if privileged:
@@ -158,7 +158,7 @@ class ConntrackMitigationOracle(MitigationOracle):
                 "restartPolicy": "Never",
                 "automountServiceAccountToken": False,
                 "nodeName": node_name,
-                "containers": [{"name": "probe", "image": "busybox:1.36", "command": ["sh", "-c", script]}],
+                "containers": [{"name": "probe", "image": "docker.io/busybox:1.36", "command": ["sh", "-c", script]}],
             },
         }
         try:

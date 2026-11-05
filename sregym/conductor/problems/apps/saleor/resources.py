@@ -355,7 +355,7 @@ while True:
                         "containers": [
                             {
                                 "name": "flood",
-                                "image": "python:3.12-alpine",
+                                "image": "docker.io/python:3.12-alpine",
                                 "command": ["python3", "-u", "-c", self.FLOOD_SCRIPT],
                                 "env": [
                                     {

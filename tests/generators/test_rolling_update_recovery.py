@@ -144,7 +144,7 @@ def test_rolling_update_injection_waits_for_healthy_baseline_before_fault_patch(
     with real_open(patch_path) as patch_file:
         patch = yaml.safe_load(patch_file)
     init_container = patch["spec"]["template"]["spec"]["initContainers"][0]
-    assert init_container["image"] == "busybox:1.36"
+    assert init_container["image"] == "docker.io/busybox:1.36"
     assert init_container["imagePullPolicy"] == "IfNotPresent"
 
 

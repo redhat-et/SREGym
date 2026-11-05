@@ -1,6 +1,6 @@
 """Capacity preflight: refuse before a full run is deployed onto a cluster that cannot hold it.
 
-`OPENSHIFT-READINESS.md` §13.4 records the arithmetic for one run on one cluster:
+The arithmetic comes from one measured run on one managed cluster:
 19 application pods plus roughly 15 observer pods on three untainted workers, with
 Loki deployed. A cluster with fewer or smaller workers accepts the deploy and then
 fails pod by pod, which costs one readiness timeout per pod and reads like an

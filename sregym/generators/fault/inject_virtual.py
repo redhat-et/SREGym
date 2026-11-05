@@ -1948,7 +1948,7 @@ class VirtualizationFaultInjector(FaultInjector):
                             "containers": [
                                 {
                                     "name": f"{service}-main",
-                                    "image": "python:3.9-slim",
+                                    "image": "docker.io/python:3.9-slim",
                                     "command": ["python3", "-m", "http.server", "8080"],
                                     "ports": [{"containerPort": 8080}],
                                 }
@@ -1976,7 +1976,7 @@ class VirtualizationFaultInjector(FaultInjector):
             }
             init = {
                 "name": "hang-init",
-                "image": "busybox:1.36",
+                "image": "docker.io/busybox:1.36",
                 "imagePullPolicy": "IfNotPresent",
                 "command": ["/bin/sh", "-c", "sleep infinity"],
             }
@@ -2056,7 +2056,7 @@ class VirtualizationFaultInjector(FaultInjector):
                         "containers": [
                             {
                                 "name": f"{service_name}-container",
-                                "image": "python:3.9-slim",
+                                "image": "docker.io/python:3.9-slim",
                                 "command": ["python", "/app/service.py"],
                                 "ports": [{"containerPort": 8080, "name": "http"}],
                                 "volumeMounts": [

@@ -143,7 +143,7 @@ class RollingUpdateMitigationOracle(Oracle):
                         "initContainers": [
                             {
                                 "name": "hang-init",
-                                "image": "busybox:1.36",
+                                "image": "docker.io/busybox:1.36",
                                 "imagePullPolicy": "IfNotPresent",
                                 "command": ["/bin/sh", "-c", "sleep 15"],
                             }

@@ -37,7 +37,7 @@ class MattermostApplication(PostgresApplication):
         volume = [{"name": "data", "persistentVolumeClaim": {"claimName": "mattermost-data"}}]
         init = {
             "name": "prepare-storage",
-            "image": "busybox:1.36.1",
+            "image": "docker.io/busybox:1.36.1",
             "command": [
                 "sh",
                 "-c",

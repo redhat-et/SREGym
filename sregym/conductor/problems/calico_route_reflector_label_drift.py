@@ -397,7 +397,7 @@ spec:
         kubernetes.io/hostname: {server_node}
       containers:
       - name: server
-        image: busybox:1.36
+        image: docker.io/busybox:1.36
         imagePullPolicy: IfNotPresent
         command: ["sh", "-c", "mkdir -p /www && echo ok > /www/index.html && httpd -f -p 8080 -h /www"]
         ports:
@@ -434,7 +434,7 @@ spec:
         kubernetes.io/hostname: {client_node}
       containers:
       - name: server
-        image: busybox:1.36
+        image: docker.io/busybox:1.36
         imagePullPolicy: IfNotPresent
         command: ["sh", "-c", "mkdir -p /www && echo ok > /www/index.html && httpd -f -p 8080 -h /www"]
         ports:
@@ -459,7 +459,7 @@ spec:
         kubernetes.io/hostname: {client_node}
       containers:
       - name: client
-        image: busybox:1.36
+        image: docker.io/busybox:1.36
         imagePullPolicy: IfNotPresent
         command: ["sh", "-c", "sleep 36000"]
 """)

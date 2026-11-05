@@ -175,7 +175,7 @@ class CumulativeAdmissionWebhookTimeoutHotelReservation(Problem):
         "image-policy-checker",
         "tenant-quota-validator",
     )
-    WEBHOOK_BACKEND_IMAGE = "python:3.12-alpine"
+    WEBHOOK_BACKEND_IMAGE = "docker.io/python:3.12-alpine"
     WEBHOOK_BACKEND_PORT = 443
 
     # Names of the cluster-scoped Secret and ConfigMap that every backend
@@ -1163,7 +1163,7 @@ srv.serve_forever()
         body = client.V1Pod(
             metadata=client.V1ObjectMeta(generate_name="admission-readiness-check-", namespace=self.namespace),
             spec=client.V1PodSpec(
-                containers=[client.V1Container(name="probe", image="busybox:1.36", command=["sleep", "1"])],
+                containers=[client.V1Container(name="probe", image="docker.io/busybox:1.36", command=["sleep", "1"])],
                 restart_policy="Never",
             ),
         )

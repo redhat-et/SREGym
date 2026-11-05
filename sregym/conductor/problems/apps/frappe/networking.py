@@ -151,7 +151,7 @@ class LoadGeneratorFloodHomepageFrappe(Problem):
     CONFIGMAP = "erp-site-warmer-flags"
     FLAG = "floodHomepage"
     CONCURRENCY = 320
-    IMAGE = "busybox:1.36"
+    IMAGE = "docker.io/busybox:1.36"
 
     def __init__(self, app_name: str = APP):
         super().__init__(app=make_app(app_name))

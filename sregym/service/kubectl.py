@@ -1183,7 +1183,7 @@ class KubeCtl:
                 containers=[
                     client.V1Container(
                         name="gc",
-                        image="busybox:1.36",
+                        image="docker.io/busybox:1.36",
                         image_pull_policy="IfNotPresent",
                         command=["sh", "-c", script],
                         env=[client.V1EnvVar(name=k, value=v) for k, v in (env or {}).items()],

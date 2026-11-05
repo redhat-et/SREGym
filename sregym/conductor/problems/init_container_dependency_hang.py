@@ -17,7 +17,7 @@ ready replicas of the affected service.
 This problem is **distinct from existing entries** in the registry:
 
 * ``rolling_update_misconfigured_*`` injects a `sleep infinity` init container
-  on a *synthetic* `python:3.9-slim` deployment as a mechanism to wedge a
+  on a *synthetic* `docker.io/python:3.9-slim` deployment as a mechanism to wedge a
   pathological `maxUnavailable: 100% / maxSurge: 0%` rolling-update strategy;
   the diagnosed root cause there is the strategy, not the init container.
 * ``rbac_misconfiguration`` makes an init container fail because of

@@ -97,7 +97,7 @@ def mongo_resources(name: str, namespace: str, members: int, authenticated: bool
         spec["initContainers"] = [
             {
                 "name": "prepare-key",
-                "image": "busybox:1.36",
+                "image": "docker.io/busybox:1.36",
                 "command": [
                     "sh",
                     "-ec",
@@ -311,7 +311,7 @@ class ScaledApplication:
                     "containers": [
                         {
                             "name": "client",
-                            "image": "python:3.12-alpine",
+                            "image": "docker.io/python:3.12-alpine",
                             "command": ["sleep", "infinity"],
                             "resources": {"requests": {"cpu": "10m", "memory": "32Mi"}, "limits": {"memory": "128Mi"}},
                         }

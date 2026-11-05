@@ -68,7 +68,7 @@ PLATFORM_VERDICTS = ("works", "fixable", "exclude")
 PLATFORM_SUPPORT = {
     "cronjob_sidecar_blocks_completion_hotel_reservation": {
         "verdict": "fixable",
-        "reason": "the injected sidecar runs unqualified `busybox:1.36`; everything else is namespaced",
+        "reason": "the injected sidecar image is qualified now and everything else is namespaced; only a cluster run can move this verdict",
         "requires": "qualified image references (plan item 8)",
     },
     "edge_request_filter_cpu_saturation": {
@@ -146,7 +146,7 @@ PLATFORM_SUPPORT = {
     },
     "rolling_update_misconfigured_social_network": {
         "verdict": "fixable",
-        "reason": "the injector writes `python:3.9-slim` and `busybox:1.36`, both unqualified",
+        "reason": "the injector writes only qualified image references now; only a cluster run can move this verdict",
         "requires": "qualified image references (plan item 8)",
     },
     "search_rate_retry_collapse_hotel_reservation": {
@@ -238,7 +238,7 @@ PLATFORM_SUPPORT = {
     },
     "rolling_update_misconfigured_frappe": {
         "verdict": "fixable",
-        "reason": "the injected init container runs unqualified `busybox:1.36`",
+        "reason": "the injected init container image is qualified now; the image reference is qualified now, so only a cluster run can move this verdict",
         "requires": "qualified image references (plan item 8)",
     },
     "search_rate_retry_collapse_slack_spine": {

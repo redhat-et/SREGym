@@ -197,7 +197,7 @@ class NodeConntrackExhaustionHotelReservation(Problem):
         )
         return {
             "name": "gateway",
-            "image": "python:3.12-alpine",
+            "image": "docker.io/python:3.12-alpine",
             "command": ["sh", "-c", 'ulimit -n 524288; exec python -c "$SCRIPT"'],
             "env": [
                 {"name": "PORTS", "value": ",".join(str(port) for port in self._gateway_ports())},
@@ -241,7 +241,7 @@ class NodeConntrackExhaustionHotelReservation(Problem):
         )
         return {
             "name": "client",
-            "image": "python:3.12-alpine",
+            "image": "docker.io/python:3.12-alpine",
             "command": ["sh", "-c", 'ulimit -n 524288; exec python -c "$SCRIPT"'],
             "env": [
                 {"name": "TARGET_HOST", "value": f"{self.gateway_service}.{self.namespace}.svc.cluster.local."},

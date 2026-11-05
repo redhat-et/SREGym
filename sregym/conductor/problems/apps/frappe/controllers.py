@@ -166,7 +166,7 @@ class RollingUpdateMisconfiguredIA(Problem):
 
     HANG_INIT = {
         "name": "hang-init",
-        "image": "busybox:1.36",
+        "image": "docker.io/busybox:1.36",
         "command": ["sh", "-c", "sleep infinity"],
     }
 

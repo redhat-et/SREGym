@@ -287,7 +287,7 @@ spec:
     spec:
       containers:
       - name: webhook
-        image: python:3.12-alpine
+        image: docker.io/python:3.12-alpine
         imagePullPolicy: IfNotPresent
         command: ["python", "/app/server.py"]
         ports:

@@ -98,6 +98,7 @@ def validate(
     *,
     deploy_loki: bool = False,
     reconcile: str | None = None,
+    allow_unqualified_images: bool = False,
 ):
     """Run the full deploy/inject/recover lifecycle. Returns (passed, stages)."""
     stages = {
@@ -115,7 +116,13 @@ def validate(
     recovery_verified = False
     deployed = False
     try:
-        conductor = Conductor(config=ConductorConfig(deploy_loki=deploy_loki, reconcile=reconcile))
+        conductor = Conductor(
+            config=ConductorConfig(
+                deploy_loki=deploy_loki,
+                reconcile=reconcile,
+                allow_unqualified_images=allow_unqualified_images,
+            )
+        )
 
         # --- Resolve the problem ----------------------------------------------
         logger.info(f"[STAGE] Resolving problem '{problem_id}'")
@@ -340,6 +347,14 @@ def main():
     )
     parser.add_argument("--with-loki", action="store_true", help="Also validate deployment of Loki and Promtail")
     parser.add_argument(
+        "--allow-unqualified-images",
+        action="store_true",
+        help=(
+            "Proceed when the image preflight finds image names with no registry host. The "
+            "preflight cannot know a cluster's short-name alias table, so it refuses by default."
+        ),
+    )
+    parser.add_argument(
         "--inject-timeout",
         type=int,
         default=INJECT_TIMEOUT_S,
@@ -383,6 +398,7 @@ def main():
         args.poll_interval,
         deploy_loki=args.with_loki,
         reconcile=args.reconcile,
+        allow_unqualified_images=args.allow_unqualified_images,
     )
 
     elapsed = time.time() - start

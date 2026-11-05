@@ -109,7 +109,16 @@ Two claims from the earlier readiness work are still unproven, and neither is en
 
 ## Where the measured facts come from
 
-Everything measured so far is in `OPENSHIFT-READINESS.md`: **one** ROSA cluster, OpenShift 4.22.18,
-Kubernetes 1.35.8, reached with a **cluster-admin login**, and with unqualified image names edited in
-place. One scenario, `network_policy_block`, passed there. A restricted login has not been measured, so
-do not claim that SREGym needs no extra rights until it is.
+One cluster only: a managed ROSA cluster, OpenShift 4.22.18, Kubernetes 1.35.8, reached with a
+**cluster-admin login**, and with unqualified image names edited in place. One scenario,
+`network_policy_block`, passed there. A restricted login has not been measured, so do not claim that
+SREGym needs no extra rights until it is. Every verdict in the table above is a reading of the code
+plus that single cluster, which is why the table says `fixable` rather than `works`.
+
+Two consequences to keep in mind when you read a claim here:
+
+- A number from that cluster is a number from **one** cluster with cluster-admin. It is not a
+  measurement of what a restricted operator sees.
+- The image references in `SREGym-applications` are unqualified. They pull on that cluster through its
+  own short-name table; on a cluster whose table differs they may not, which is what the image
+  preflight refuses ahead of time.

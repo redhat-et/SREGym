@@ -1115,6 +1115,7 @@ def _run_benchmark(args, *, judge_backend: str = "api", agent_image: str | None 
         baseline_override_s=getattr(args, "baseline", None),
         propagation_override_s=getattr(args, "propagation", None),
         reconcile=getattr(args, "reconcile", None),
+        allow_unqualified_images=bool(getattr(args, "allow_unqualified_images", False)),
     )
     LAUNCHER.set_internet_policy(conductor_config.internet_policy)
     LAUNCHER.set_container_hardening(harden_container)
@@ -1366,6 +1367,15 @@ if __name__ == "__main__":
             f"Storage class for every volume the run provisions. Default: the OpenEBS class "
             f"('{OPENebs}'), which the harness installs and marks as default. A named class must "
             "already exist in the cluster and be its default storage class."
+        ),
+    )
+    parser.add_argument(
+        "--allow-unqualified-images",
+        action="store_true",
+        help=(
+            "Proceed when the image preflight finds manifests whose image names carry no registry "
+            "host. The preflight cannot know a cluster's short-name alias table, so it refuses by "
+            "default; this asserts that this cluster resolves those names. Every finding is logged."
         ),
     )
     parser.add_argument(

@@ -114,7 +114,7 @@ class NamespaceMemoryLimitMitigationOracle(Oracle):
                 containers=[
                     client.V1Container(
                         name="probe",
-                        image="busybox:1.36",
+                        image="docker.io/busybox:1.36",
                         image_pull_policy="IfNotPresent",
                         command=["sh", "-c", script],
                     )

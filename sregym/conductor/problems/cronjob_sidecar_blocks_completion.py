@@ -96,7 +96,7 @@ class CronJobSidecarBlocksCompletionHotelReservation(Problem):
     PRIMARY_CONTAINER = "archiver"
     SIDECAR_CONTAINER = "fluent-bit-sidecar"
     SIDECAR_PORT = 24224
-    WORKLOAD_IMAGE = "busybox:1.36"
+    WORKLOAD_IMAGE = "docker.io/busybox:1.36"
     SCHEDULE = "* * * * *"
 
     # Wait until at least this many Jobs from the CronJob exist before

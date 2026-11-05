@@ -24,7 +24,7 @@ _CLUSTERROLE_NAME = "configmap-cleanup-controller"
 _CLUSTERROLEBINDING_NAME = "configmap-cleanup-controller"
 _CONFIGMAP_NAME = "reservation-cleanup-token"
 _FINALIZER = "cleanup.reservations.io/pending-cleanup"
-_CONTROLLER_IMAGE = "python:3.12-alpine"
+_CONTROLLER_IMAGE = "docker.io/python:3.12-alpine"
 _MANAGED_LABELS = {"app.kubernetes.io/managed-by": _CONTROLLER_NAME}
 
 

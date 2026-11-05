@@ -124,7 +124,7 @@ def test_accepts_safe_strategy_after_stable_probe_rollout(monkeypatch):
     assert _oracle(kubectl).evaluate()["success"] is True
     assert len(kubectl.patch_commands) == 2
     probe_container = kubectl.patches[0]["spec"]["template"]["spec"]["initContainers"][0]
-    assert probe_container["image"] == "busybox:1.36"
+    assert probe_container["image"] == "docker.io/busybox:1.36"
     assert probe_container["imagePullPolicy"] == "IfNotPresent"
     restored_template = kubectl.patches[1]["spec"]["template"]
     assert restored_template["spec"]["initContainers"] is None

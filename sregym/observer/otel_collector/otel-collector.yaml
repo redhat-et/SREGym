@@ -117,7 +117,7 @@ spec:
           effect: "NoSchedule"
       containers:
         - name: otel-collector
-          image: otel/opentelemetry-collector-contrib:0.104.0
+          image: docker.io/otel/opentelemetry-collector-contrib:0.104.0
           args:
             - "--config=/etc/otel/config.yaml"
           ports:

@@ -27,7 +27,7 @@ class DevShmExhaustionHotelReservation(Problem):
     """
 
     worker_name = "media-processor"
-    worker_image = "busybox:1.36"
+    worker_image = "docker.io/busybox:1.36"
     shm_mount_path = "/dev/shm"
     scratch_mib = 128
 

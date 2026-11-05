@@ -127,7 +127,7 @@ class InternalTrafficPolicyMitigationOracle(MitigationOracle):
                 "restartPolicy": "Never",
                 "automountServiceAccountToken": False,
                 "nodeName": node_name,
-                "containers": [{"name": "probe", "image": "busybox:1.36", "command": ["sh", "-c", script]}],
+                "containers": [{"name": "probe", "image": "docker.io/busybox:1.36", "command": ["sh", "-c", script]}],
             },
         }
         try:
