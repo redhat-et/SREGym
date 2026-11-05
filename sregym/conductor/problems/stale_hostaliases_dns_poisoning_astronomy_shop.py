@@ -28,6 +28,7 @@ from sregym.profile import is_svelte
 from sregym.service.apps.astronomy_shop import AstronomyShop
 from sregym.service.helm import Helm
 from sregym.service.kubectl import KubeCtl
+from sregym.storage import get_storage_class
 from sregym.utils.decorators import mark_fault_injected
 
 CART_CLIENT = r"""
@@ -219,7 +220,8 @@ class StaleHostAliasesDNSPoisoningAstronomyShop(Problem):
             "components.valkey-cart.resources.limits.memory": "64Mi",
         }
         for key, value in settings.items():
-            args += ["--set-json", shlex.quote(f"{key}={json.dumps(value)}")]
+            # One argv element: quoting it would hand Helm the quotes themselves.
+            args += ["--set-json", f"{key}={json.dumps(value)}"]
         Helm.install(**{**self.app.helm_configs, "extra_args": args})
         Helm.assert_if_deployed(self.namespace)
         Jaeger().create_external_name_service(self.namespace)
@@ -232,7 +234,11 @@ class StaleHostAliasesDNSPoisoningAstronomyShop(Problem):
                 "apiVersion": "v1",
                 "kind": "PersistentVolumeClaim",
                 "metadata": {"name": name},
-                "spec": {"accessModes": ["ReadWriteOnce"], "resources": {"requests": {"storage": "64Mi"}}},
+                "spec": {
+                    "accessModes": ["ReadWriteOnce"],
+                    "storageClassName": get_storage_class(),
+                    "resources": {"requests": {"storage": "64Mi"}},
+                },
             }
         )
         template = self._get("deployment", name)["spec"]["template"]

@@ -1,15 +1,14 @@
 import json
 import logging
 import subprocess
-from pathlib import Path
-
-import yaml
 
 from sregym.paths import BASE_DIR, PROMETHEUS_METADATA
 from sregym.profile import is_svelte
 from sregym.service.helm import Helm
-from sregym.service.kubectl import WAIT_FOR_POD_READY_TIMEOUT, KubeCtl
+from sregym.service.kubectl import KubeCtl
 from sregym.service.rollout import deployment_rollout_complete
+from sregym.service.telemetry.release_pvcs import delete_retained_pvcs
+from sregym.storage import get_storage_class, uses_openebs
 
 
 class Prometheus:
@@ -66,8 +65,9 @@ class Prometheus:
 
     def deploy(self):
         """Deploy the metric collector using Helm."""
-        if self._is_prometheus_running() and self._matches_requested_profile():
-            self.logger.info("Prometheus already uses the requested profile. Skipping redeployment.")
+        helm_configs = self._requested_helm_configs()
+        if self._is_prometheus_running() and Helm.release_matches_requested_values(helm_configs):
+            self.logger.info("Prometheus runs the requested values. Skipping redeployment.")
             return
 
         # Wait for namespace to be fully terminated before attempting fresh install
@@ -76,76 +76,29 @@ class Prometheus:
         Helm.uninstall(**self.helm_configs)
         self._delete_retained_pvcs()
 
-        helm_configs = dict(self.helm_configs)
-        if is_svelte():
-            svelte_values = BASE_DIR / "observer" / "prometheus" / "values-svelte.yaml"
-            helm_configs["extra_args"] = [*helm_configs.get("extra_args", []), "-f", str(svelte_values)]
-            self.logger.info("[svelte] Dropping Alertmanager and Pushgateway; retention 15d -> 2h")
-
         Helm.install(**helm_configs)
+        Helm.record_values_fingerprint(helm_configs)
         Helm.assert_if_deployed(self.namespace)
 
+    def _requested_helm_configs(self) -> dict:
+        """The Helm config of this deployment: the metadata config plus profile and class."""
+        helm_configs = dict(self.helm_configs)
+        extra_args = list(helm_configs.get("extra_args", []))
+        if is_svelte():
+            svelte_values = BASE_DIR / "observer" / "prometheus" / "values-svelte.yaml"
+            extra_args += ["-f", str(svelte_values)]
+            self.logger.info("[svelte] Dropping Alertmanager and Pushgateway; retention 15d -> 2h")
+        if not uses_openebs():
+            # The vendored values file names openebs-hostpath, which is the `kind`
+            # render input. Any other class is passed over it, unchanged.
+            extra_args += ["--set-string", f"server.persistentVolume.storageClass={get_storage_class()}"]
+        if extra_args:
+            helm_configs["extra_args"] = extra_args
+        return helm_configs
+
     def _delete_retained_pvcs(self) -> None:
-        """Remove release PVCs that Helm intentionally retains on uninstall.
-
-        A failed LocalPV helper can leave a claim Bound even though its node
-        directory was never created. Reusing that claim makes every later
-        Prometheus install fail at mount time, so a fresh Helm install must also
-        start with fresh release storage.
-        """
-        release_name = self.helm_configs["release_name"]
-        subprocess.run(
-            [
-                "kubectl",
-                "delete",
-                "pvc",
-                "-n",
-                self.namespace,
-                "-l",
-                f"app.kubernetes.io/instance={release_name}",
-                "--ignore-not-found=true",
-                "--wait=true",
-                f"--timeout={WAIT_FOR_POD_READY_TIMEOUT}s",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=WAIT_FOR_POD_READY_TIMEOUT + 10,
-        )
-
-    def _matches_requested_profile(self) -> bool:
-        """Compare installed Helm values with the settings controlled by the profile."""
-        result = subprocess.run(
-            [
-                "helm",
-                "get",
-                "values",
-                self.helm_configs["release_name"],
-                "-n",
-                self.namespace,
-                "--all",
-                "-o",
-                "json",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        installed = json.loads(result.stdout)
-        with open(Path(self.helm_configs["chart_path"]) / "values.yaml") as file:
-            expected = yaml.safe_load(file)
-        # Compare actual values rather than a new marker, so releases installed
-        # before profile tracking also work. Other Helm values remain unrelated.
-        with open(BASE_DIR / "observer" / "prometheus" / "values-svelte.yaml") as file:
-            svelte_values = yaml.safe_load(file)
-        for component, settings in svelte_values.items():
-            for setting, svelte_value in settings.items():
-                wanted = svelte_value if is_svelte() else expected[component][setting]
-                if installed.get(component, {}).get(setting) != wanted:
-                    self.logger.info("Prometheus profile differs at %s.%s; redeploying", component, setting)
-                    return False
-        return True
+        """Remove release PVCs that Helm intentionally retains on uninstall."""
+        delete_retained_pvcs(self.namespace, self.helm_configs["release_name"])
 
     def teardown(self):
         """Teardown the metric collector deployment."""

@@ -55,12 +55,11 @@ class GitLabNotificationApplication(GitLabRecoveryApplication):
     smtp_enabled = True
     notification_preset = STANDARD_NOTIFICATIONS
 
-    def __init__(
-        self, tier="replicated", storage_class="openebs-hostpath", *, preset: NotificationPreset | None = None
-    ):
+    def __init__(self, tier="replicated", storage_class=None, *, preset: NotificationPreset | None = None):
         self.notification_preset = preset or self.notification_preset
         self.mail_provider = self.notification_preset.provider
         self.describe_notifications = self.notification_preset.describe
+        # PostgresApplication resolves a None storage class from the active selection.
         super().__init__(tier, storage_class)
 
     def database_document(self):

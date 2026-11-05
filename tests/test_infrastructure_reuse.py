@@ -391,11 +391,11 @@ def test_real_helm_missing_local_chart_stops_before_install(monkeypatch, chart):
     path = chart([{"name": "missing-local", "version": "1.0.0"}])
     popen = MagicMock()
     # dependency list/update use subprocess.run, which needs the real Popen.
-    # Intercept only the eventual shell-based install command.
+    # Intercept only the eventual helm install command.
     original = helm_module.subprocess.Popen
 
     def no_install(command, *args, **kwargs):
-        if isinstance(command, str) and command.startswith("helm install "):
+        if isinstance(command, list) and command[:2] == ["helm", "install"]:
             return popen(command, *args, **kwargs)
         return original(command, *args, **kwargs)
 

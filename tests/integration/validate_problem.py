@@ -29,6 +29,7 @@ from sregym.cluster_platform import KIND, PLATFORMS, set_platform
 from sregym.conductor.conductor import Conductor, ConductorConfig, reconcile_refusal
 from sregym.profile import PROFILES, set_profile
 from sregym.service.cluster_state import RECONCILE_MODES
+from sregym.storage import OPENebs, get_storage_class, set_storage_class, validate_storage_class_name
 
 logger = logging.getLogger("all.sregym.validate_problem")
 
@@ -306,6 +307,16 @@ def main():
         ),
     )
     parser.add_argument(
+        "--storage-class",
+        default=None,
+        metavar="NAME",
+        help=(
+            f"Storage class for every volume the run provisions. Default: the OpenEBS class "
+            f"('{OPENebs}'), which the harness installs and marks as default. A named class must "
+            "already exist in the cluster and be its default storage class."
+        ),
+    )
+    parser.add_argument(
         "--reconcile",
         choices=RECONCILE_MODES,
         default=None,
@@ -348,6 +359,12 @@ def main():
     init_logger()
     set_profile(args.profile)
     set_platform(args.platform)
+    # The storage class is caller input, so it is checked before any chart names it.
+    if args.storage_class:
+        try:
+            set_storage_class(validate_storage_class_name(args.storage_class))
+        except ValueError as exc:
+            sys.exit(str(exc))
     # Reconcile deletes every object absent from the baseline, so on a managed
     # platform it needs a second yes before any cluster work starts.
     refusal = reconcile_refusal(args.reconcile, args.confirm_destructive_reconcile)
@@ -374,6 +391,7 @@ def main():
                     "problem": args.problem,
                     "profile": args.profile,
                     "platform": args.platform,
+                    "storage_class": get_storage_class(),
                     "with_loki": args.with_loki,
                     "passed": passed,
                     "elapsed_seconds": round(elapsed, 2),

@@ -60,6 +60,7 @@ from sregym.service.mcp_server import MCPServer
 from sregym.service.rollout import deployment_rollout_complete
 from sregym.service.telemetry.loki import Loki
 from sregym.service.telemetry.prometheus import Prometheus
+from sregym.storage import OPENebs, get_storage_class, uses_openebs
 
 # The agent-facing stages, in the only order they can run. Shared with
 # `--stages`' choices so the CLI and the conductor cannot disagree about what
@@ -1597,7 +1598,6 @@ class Conductor:
 
         self._ensure_metrics_api()
 
-        self.logger.info("[DEPLOY] Setting up OpenEBS…")
         svelte = is_svelte()
         if is_openshift() and svelte:
             self.logger.info(
@@ -1605,46 +1605,56 @@ class Conductor:
                 "too. Once it is gated, `svelte` and `full` will differ here only by the Prometheus values "
                 "overlay."
             )
-        # `openebs` is protected from reconciliation, so it persists across
-        # problems and the operator manifest only needs fetching once.
-        if self._openebs_ready(svelte):
-            self.logger.info("[DEPLOY] OpenEBS already deployed; skipping operator re-apply")
-        else:
-            if not svelte:
-                # The udev preflight exists solely for the node-disk-manager,
-                # which svelte does not deploy.
-                self._preflight_openebs_udev_mount()
-            self.kubectl.exec_command("kubectl apply -f https://openebs.github.io/charts/openebs-operator.yaml")
-            self.kubectl.exec_command(
-                "kubectl patch storageclass openebs-hostpath "
-                '-p \'{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}\''
+        if uses_openebs():
+            self.logger.info("[DEPLOY] Setting up OpenEBS…")
+            # `openebs` is protected from reconciliation, so it persists across
+            # problems and the operator manifest only needs fetching once.
+            if self._openebs_ready(svelte):
+                self.logger.info("[DEPLOY] OpenEBS already deployed; skipping operator re-apply")
+            else:
+                if not svelte:
+                    # The udev preflight exists solely for the node-disk-manager,
+                    # which svelte does not deploy.
+                    self._preflight_openebs_udev_mount()
+                self.kubectl.exec_command("kubectl apply -f https://openebs.github.io/charts/openebs-operator.yaml")
+                self._make_openebs_hostpath_default()
+                if not svelte:
+                    # The operator manifest has no NDM node selector. An extra
+                    # selector can survive apply and prevent every NDM pod scheduling.
+                    self.kubectl.apps_v1_api.patch_namespaced_daemon_set(
+                        "openebs-ndm",
+                        "openebs",
+                        [{"op": "add", "path": "/spec/template/spec/nodeSelector", "value": {}}],
+                        _request_timeout=10,
+                    )
+            # Idempotent and cheap; also covers an `openebs` left over from an
+            # earlier full-profile run on the same cluster.
+            if svelte:
+                self._trim_openebs_ndm()
+            # An interrupted preload can leave completed non-Job pods behind.
+            # Remove only our disposable helpers before checking OpenEBS readiness.
+            self.kubectl.exec_command_checked(
+                "kubectl delete pods -n openebs -l app=sregym-image-preload "
+                "--ignore-not-found=true --grace-period=0 --wait=true "
+                f"--timeout={WAIT_FOR_POD_READY_TIMEOUT}s",
+                timeout=WAIT_FOR_POD_READY_TIMEOUT + 10,
             )
+            self.kubectl.wait_for_ready("openebs")
+            self._wait_for_infrastructure_ready("OpenEBS", lambda: self._openebs_ready(svelte))
+            self._preload_openebs_helper_image()
             if not svelte:
-                # The operator manifest has no NDM node selector. An extra
-                # selector can survive apply and prevent every NDM pod scheduling.
-                self.kubectl.apps_v1_api.patch_namespaced_daemon_set(
-                    "openebs-ndm",
-                    "openebs",
-                    [{"op": "add", "path": "/spec/template/spec/nodeSelector", "value": {}}],
-                    _request_timeout=10,
-                )
-        # Idempotent and cheap; also covers an `openebs` left over from an
-        # earlier full-profile run on the same cluster.
-        if svelte:
-            self._trim_openebs_ndm()
-        # An interrupted preload can leave completed non-Job pods behind.
-        # Remove only our disposable helpers before checking OpenEBS readiness.
-        self.kubectl.exec_command_checked(
-            "kubectl delete pods -n openebs -l app=sregym-image-preload "
-            "--ignore-not-found=true --grace-period=0 --wait=true "
-            f"--timeout={WAIT_FOR_POD_READY_TIMEOUT}s",
-            timeout=WAIT_FOR_POD_READY_TIMEOUT + 10,
-        )
-        self.kubectl.wait_for_ready("openebs")
-        self._wait_for_infrastructure_ready("OpenEBS", lambda: self._openebs_ready(svelte))
-        self._preload_openebs_helper_image()
-        if not svelte:
-            self._ensure_openebs_device_storageclass()
+                self._ensure_openebs_device_storageclass()
+        else:
+            # Every step of the block above exists to install or repair OpenEBS. A
+            # class the cluster already provides needs none of them, and the run has
+            # to check that class instead.
+            self.logger.info(
+                "[DEPLOY] Skipping OpenEBS: this run uses storage class %r, which the cluster already "
+                "provides, so the operator, the openebs-hostpath default patch, the node-disk-manager, the "
+                "helper-image preload and openebs-device are not needed",
+                get_storage_class(),
+            )
+            self.verify_storage_class()
 
         self.logger.info("[DEPLOY] Deploying Prometheus…")
         self.prometheus.deploy()
@@ -1955,6 +1965,105 @@ reclaimPolicy: Delete
         result = self.kubectl.exec_command("kubectl apply -f -", input_data=device_sc_yaml)
         if "error from server" in result.lower() or "invalid" in result.lower():
             raise RuntimeError(f"Failed to create StorageClass/openebs-device: {result.strip()}")
+
+    # A StorageClass names itself as cluster default through this annotation. Two
+    # classes carrying it make the default ambiguous, so the whole set is read.
+    _DEFAULT_CLASS_ANNOTATION = "storageclass.kubernetes.io/is-default-class"
+
+    def _default_storage_classes(self) -> set[str]:
+        """Return the names of the storage classes the cluster marks as default."""
+        listed = self.kubectl.exec_command("kubectl get storageclass -o json --request-timeout=10s")
+        try:
+            items = json.loads(listed).get("items", [])
+        except (ValueError, AttributeError) as exc:
+            raise RuntimeError(f"Could not list the cluster's storage classes: {listed.strip()}") from exc
+        return {
+            item["metadata"]["name"]
+            for item in items
+            if (item.get("metadata", {}).get("annotations") or {}).get(self._DEFAULT_CLASS_ANNOTATION) == "true"
+        }
+
+    def _make_openebs_hostpath_default(self) -> None:
+        """Make `openebs-hostpath` the cluster default, but never take the default from another class.
+
+        The patch used to run unconditionally, so every deployment took the default away
+        from whatever class the cluster came with. That is a deliberate `kind` behaviour
+        change: a cluster that serves its own default class keeps it.
+        """
+        default_classes = self._default_storage_classes()
+        if default_classes and default_classes != {OPENebs}:
+            self.logger.info(
+                "[DEPLOY] Keeping %s as the cluster default; openebs-hostpath is no longer forced to be "
+                "the default (deliberate kind behaviour change)",
+                ", ".join(sorted(default_classes)),
+            )
+            return
+        reason = "it is already the default" if default_classes else "no storage class was the default"
+        self.logger.info("[DEPLOY] Patching StorageClass/%s to be the cluster default because %s", OPENebs, reason)
+        self.kubectl.exec_command(
+            f"kubectl patch storageclass {OPENebs} "
+            '-p \'{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}\''
+        )
+
+    def verify_storage_class(self) -> None:
+        """Require the selected storage class to exist, provision dynamically and be the default.
+
+        Fail closed, because the harness does not own every claim it causes: third-party
+        charts and the submodule's PVCs name no class, so they bind through the cluster
+        default. A class the harness cannot bind through therefore has to stop the run
+        before it deploys anything.
+        """
+        name = get_storage_class()
+        read = self.kubectl.exec_command(
+            f"kubectl get storageclass {shlex.quote(name)} -o json --ignore-not-found --request-timeout=10s"
+        )
+        try:
+            storage_class = json.loads(read) if read.strip() else None
+        except ValueError as exc:
+            raise RuntimeError(f"Could not read storage class {name!r}: {read.strip()}") from exc
+        if not isinstance(storage_class, dict) or not storage_class:
+            raise RuntimeError(
+                f"Storage class {name!r} does not exist on this cluster; the class named by --storage-class "
+                "(or $SREGYM_STORAGE_CLASS) must exist on this cluster."
+            )
+
+        provisioner = storage_class.get("provisioner") or ""
+        if not provisioner or provisioner == "kubernetes.io/no-provisioner":
+            raise RuntimeError(
+                f"Storage class {name!r} has provisioner {provisioner or 'none'}, but a dynamically provisioned "
+                "class is required: a static class needs a hand-made PersistentVolume for every claim, which "
+                "this harness does not create."
+            )
+
+        default_classes = self._default_storage_classes()
+        if default_classes != {name}:
+            current = ", ".join(sorted(default_classes))
+            if not default_classes:
+                state = "no storage class is the cluster default"
+                advice = f"make {name!r} the default before the run"
+            elif name in default_classes:
+                state = (
+                    f"{len(default_classes)} storage classes are the cluster default ({current}), and {name!r} is "
+                    "one of them; exactly one must be, because a claim that names no class would otherwise bind "
+                    "through whichever default the cluster picks"
+                )
+                advice = f"remove the default annotation from the other {len(default_classes) - 1} before the run"
+            else:
+                state = f"the cluster default is {current}, not {name!r}"
+                advice = (
+                    f"pass --storage-class {sorted(default_classes)[0]} on this cluster, or make {name!r} the default"
+                )
+            raise RuntimeError(
+                f"Storage class {name!r} cannot be used: {state}. Third-party charts and the submodule's PVCs carry "
+                f"no storage class, so they bind through the default: {advice}."
+            )
+
+        if (storage_class.get("reclaimPolicy") or "Delete") == "Retain":
+            self.logger.warning(
+                "[DEPLOY] Storage class %r reclaims with Retain, so the volumes it backs outlive their claims; "
+                "that is legitimate and not refused, and the harness's own cleanup covers the leftovers it creates",
+                name,
+            )
 
     def get_deployed_apps(self):
         deployed_apps = []

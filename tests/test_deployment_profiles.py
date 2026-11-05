@@ -2,19 +2,16 @@ import csv
 import importlib.util
 import json
 import logging
-import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-import yaml
 from kubernetes.client.rest import ApiException
 
 from sregym import profile
 from sregym.conductor.conductor import Conductor
-from sregym.paths import BASE_DIR
 from sregym.service.cluster_state import ClusterBaseline
 from sregym.service.helm import Helm
 from sregym.service.telemetry import prometheus as prometheus_module
@@ -25,15 +22,6 @@ from sregym.service.telemetry.prometheus import Prometheus
 def reset_profile(monkeypatch):
     monkeypatch.setattr(profile, "_profile", None)
     monkeypatch.delenv("SREGYM_PROFILE", raising=False)
-
-
-def helm_values(prometheus, selected_profile):
-    values = yaml.safe_load((Path(prometheus.helm_configs["chart_path"]) / "values.yaml").read_text())
-    if selected_profile == "svelte":
-        overlay = yaml.safe_load((BASE_DIR / "observer/prometheus/values-svelte.yaml").read_text())
-        for component, settings in overlay.items():
-            values[component].update(settings)
-    return values
 
 
 def prometheus_server(kind="Deployment"):
@@ -63,32 +51,27 @@ def prometheus_pod(*, ready=True, server=True):
 
 @pytest.mark.parametrize("installed", ["full", "svelte"])
 @pytest.mark.parametrize("requested", ["full", "svelte"])
-def test_prometheus_reuses_only_the_requested_profile(monkeypatch, installed, requested):
+def test_prometheus_reuses_only_the_requested_values(monkeypatch, installed, requested):
+    """The fingerprint of the other profile refuses reuse; see test_telemetry_release_reuse."""
     prometheus = Prometheus()
     profile.set_profile(requested)
-    values = helm_values(prometheus, installed)
-    # Settings outside the profile do not force an unnecessary reinstall.
-    values["unrelatedSetting"] = "preserved"
-    run = MagicMock(return_value=SimpleNamespace(stdout=json.dumps(values)))
-    monkeypatch.setattr(prometheus_module.subprocess, "run", run)
     monkeypatch.setattr(prometheus, "_is_prometheus_running", lambda: True)
     monkeypatch.setattr(prometheus, "_wait_for_namespace_termination", lambda: None)
+    monkeypatch.setattr(prometheus, "_delete_retained_pvcs", MagicMock())
     helm = MagicMock(spec=Helm)
+    helm.release_matches_requested_values.return_value = installed == requested
     monkeypatch.setattr(prometheus_module, "Helm", helm)
 
     prometheus.deploy()
 
-    assert any(call.args[0][-3:] == ["--all", "-o", "json"] for call in run.call_args_list)
     assert helm.install.call_count == (installed != requested)
     assert helm.uninstall.call_count == (installed != requested)
     assert helm.assert_if_deployed.call_count == (installed != requested)
+    assert helm.record_values_fingerprint.call_count == (installed != requested)
     if installed != requested:
         extra_args = helm.install.call_args.kwargs.get("extra_args", [])
         assert any("values-svelte.yaml" in arg for arg in extra_args) == (requested == "svelte")
-        delete = run.call_args_list[-1]
-        assert delete.args[0][:4] == ["kubectl", "delete", "pvc", "-n"]
-        assert "app.kubernetes.io/instance=prometheus" in delete.args[0]
-        assert delete.kwargs["check"] is True
+        assert helm.record_values_fingerprint.call_args.args[0] == helm.install.call_args.kwargs
 
 
 @pytest.mark.parametrize("requested", ["full", "svelte"])
@@ -99,12 +82,10 @@ def test_prometheus_fresh_install_does_not_query_a_missing_release(monkeypatch, 
     monkeypatch.setattr(prometheus, "_wait_for_namespace_termination", lambda: None)
     cleanup = MagicMock()
     monkeypatch.setattr(prometheus, "_delete_retained_pvcs", cleanup)
-    query = MagicMock()
-    monkeypatch.setattr(prometheus, "_matches_requested_profile", query)
     helm = MagicMock(spec=Helm)
     monkeypatch.setattr(prometheus_module, "Helm", helm)
     prometheus.deploy()
-    query.assert_not_called()
+    helm.release_matches_requested_values.assert_not_called()
     cleanup.assert_called_once_with()
     helm.install.assert_called_once()
 
@@ -176,37 +157,16 @@ def test_prometheus_does_not_reuse_missing_or_unreadable_resources(monkeypatch, 
     assert not Prometheus()._is_prometheus_running()
 
 
-@pytest.mark.parametrize(
-    "component,setting,value",
-    [
-        ("alertmanager", "enabled", True),
-        ("prometheus-pushgateway", "enabled", True),
-        ("server", "retention", "15d"),
-        ("server", "resources", {}),
-    ],
-)
-def test_prometheus_checks_every_profile_setting(monkeypatch, component, setting, value):
-    prometheus = Prometheus()
-    profile.set_profile("svelte")
-    values = helm_values(prometheus, "svelte")
-    values[component][setting] = value
-    monkeypatch.setattr(
-        prometheus_module.subprocess, "run", MagicMock(return_value=SimpleNamespace(stdout=json.dumps(values)))
-    )
-    assert not prometheus._matches_requested_profile()
+@pytest.mark.parametrize("installed_profile", ["full", "svelte"])
+def test_a_profile_switch_changes_the_requested_fingerprint(installed_profile):
+    """The profile is part of the requested values, so the other profile's release is not reused."""
+    profile.set_profile(installed_profile)
+    installed = Helm.requested_values_fingerprint(Prometheus()._requested_helm_configs())
 
+    profile.set_profile("full" if installed_profile == "svelte" else "svelte")
+    requested = Helm.requested_values_fingerprint(Prometheus()._requested_helm_configs())
 
-@pytest.mark.parametrize("error", [subprocess.CalledProcessError(1, "helm"), subprocess.TimeoutExpired("helm", 30)])
-def test_prometheus_query_failure_does_not_remove_the_release(monkeypatch, error):
-    prometheus = Prometheus()
-    monkeypatch.setattr(prometheus, "_is_prometheus_running", lambda: True)
-    monkeypatch.setattr(prometheus_module.subprocess, "run", MagicMock(side_effect=error))
-    helm = MagicMock(spec=Helm)
-    monkeypatch.setattr(prometheus_module, "Helm", helm)
-    with pytest.raises(type(error)):
-        prometheus.deploy()
-    helm.uninstall.assert_not_called()
-    helm.install.assert_not_called()
+    assert requested != installed
 
 
 @pytest.mark.parametrize("preexisting", [False, True])

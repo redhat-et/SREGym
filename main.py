@@ -41,6 +41,7 @@ from sregym.service.container_runner import ContainerRunner, ExecInput, get_cont
 from sregym.service.internet_policy import EndpointRule, InternetPolicy
 from sregym.service.judge_runtime import JUDGE_BACKENDS, managed_judge_backend
 from sregym.service.kubectl import ContainerPlatformError
+from sregym.storage import OPENebs, set_storage_class, validate_storage_class_name
 from sregym.traces import postprocess as trace_postprocess
 from sregym.traces import store as trace_store
 
@@ -935,6 +936,14 @@ def _run_benchmark(args, *, judge_backend: str = "api", agent_image: str | None 
     agent_model, judge_model = _configure_model_environment(args)
     # The platform has to be known before anything derives behaviour from it.
     set_platform(args.platform)
+    # The storage class is caller input, so it is checked before any chart names it.
+    # tests build args without the flag, hence getattr.
+    storage_class = getattr(args, "storage_class", None)
+    if storage_class:
+        try:
+            set_storage_class(validate_storage_class_name(storage_class))
+        except ValueError as exc:
+            sys.exit(str(exc))
     # Reconcile deletes every object absent from the baseline, so on a managed
     # platform it needs a second yes before any cluster work starts.
     refusal = reconcile_refusal(getattr(args, "reconcile", None), getattr(args, "confirm_destructive_reconcile", False))
@@ -1242,6 +1251,16 @@ if __name__ == "__main__":
             "Cluster platform. 'kind' (default) is a local kind cluster. 'openshift' is a managed "
             "OpenShift cluster: the harness then skips installing cluster-wide components (such as the "
             "metrics API) the platform already provides."
+        ),
+    )
+    parser.add_argument(
+        "--storage-class",
+        default=None,
+        metavar="NAME",
+        help=(
+            f"Storage class for every volume the run provisions. Default: the OpenEBS class "
+            f"('{OPENebs}'), which the harness installs and marks as default. A named class must "
+            "already exist in the cluster and be its default storage class."
         ),
     )
     parser.add_argument(

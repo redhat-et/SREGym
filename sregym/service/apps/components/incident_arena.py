@@ -110,7 +110,7 @@ class IncidentArenaApplication(Application):
             overrides.write_text(yaml.safe_dump(values, sort_keys=False), encoding="utf-8")
             extra_args = ["-f", str(self.values_file), "-f", str(overrides)]
             if install:
-                Helm.install(**self.helm_configs, extra_args=[shlex.quote(arg) for arg in extra_args])
+                Helm.install(**self.helm_configs, extra_args=extra_args)
             else:
                 cfg = self.helm_configs
                 command = ["helm", "upgrade", cfg["release_name"], cfg["chart_path"], "-n", self.namespace, *extra_args]

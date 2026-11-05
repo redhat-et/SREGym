@@ -29,17 +29,16 @@ class ChaosInjector:
             pass
         elif "containerd" in container_runtime:
             chaos_configs["extra_args"] = [
-                "--set chaosDaemon.runtime=containerd",
-                "--set chaosDaemon.socketPath=/run/containerd/containerd.sock",
+                "--set",
+                "chaosDaemon.runtime=containerd",
+                "--set",
+                "chaosDaemon.socketPath=/run/containerd/containerd.sock",
             ]
         else:
             raise ValueError(f"Unsupported container runtime: {container_runtime}")
 
         # Disable security for the dashboard
-        if chaos_configs.get("extra_args"):
-            chaos_configs["extra_args"].append("--set dashboard.securityMode=false")
-        else:
-            chaos_configs["extra_args"] = ["--set dashboard.securityMode=false"]
+        chaos_configs["extra_args"] = [*chaos_configs.get("extra_args", []), "--set", "dashboard.securityMode=false"]
 
         # Check if the release already exists
         release_exists = Helm.exists_release(chaos_configs["release_name"], chaos_configs["namespace"])

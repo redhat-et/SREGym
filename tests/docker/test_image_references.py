@@ -2,7 +2,6 @@ import copy
 import importlib
 import json
 import re
-import shlex
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -254,7 +253,7 @@ def test_helm_install_passes_the_image_override_file_to_helm():
             values_file=values_file,
             extra_args=["--wait"],
         )
-    command = shlex.split(popen.call_args.args[0])
+    command = popen.call_args.args[0]
     assert command[command.index("-f") + 1] == values_file
     assert command[-1] == "--wait"
 

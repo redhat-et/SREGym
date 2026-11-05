@@ -1,9 +1,11 @@
 """Interface for helm operations"""
 
+import hashlib
+import json
 import logging
-import shlex
 import subprocess
 import time
+from collections.abc import Sequence
 from pathlib import Path
 
 import yaml
@@ -13,6 +15,14 @@ from sregym.service.kubectl import KubeCtl
 logger = logging.getLogger("all.infra.helm")
 logger.propagate = True
 logger.setLevel(logging.DEBUG)
+
+# Marker on the release's own Helm secrets: the values the release was installed with.
+# Helm owns those secrets, so the marker disappears with the release it describes.
+VALUES_FINGERPRINT_ANNOTATION = "sregym.io/values-fingerprint"
+# Returned by `requested_values_fingerprint` when an input cannot be read. Nothing is ever
+# recorded under this value, so comparing against it always refuses reuse.
+UNKNOWN_VALUES_FINGERPRINT = "unknown"
+FINGERPRINT_COMMAND_TIMEOUT = 60
 
 
 class Helm:
@@ -26,8 +36,16 @@ class Helm:
             namespace (str): Namespace to install the chart
             version (str): Version of the chart
             values_file (str): Optional values override file
-            extra_args (List[str)]: Extra arguments for the helm install command
+            extra_args (List[str | Sequence[str]]): Extra arguments for the helm install
+                command. A string entry is one argument, exactly as given, and is never
+                split; a sequence entry contributes its elements in order. Nothing is
+                split and nothing reaches a shell, so a value that holds a space stays
+                one argument.
             remote_chart (bool): Whether the chart is remote (from a Helm repo)
+
+        An `extra_args` string entry used to be split with `shlex.split`, so a path with a
+        space silently became two arguments. That was a defect, not a convention: pass the
+        flag and its value as separate entries, for example `["--set", "a=b"]`.
         """
 
         release_name = args.get("release_name")
@@ -42,18 +60,19 @@ class Helm:
         if not remote_chart:
             Helm.ensure_dependencies(chart_path)
 
-        command = f"helm install {release_name} {chart_path} -n {namespace} --create-namespace"
+        # An argv list, never a shell string: a storage class name or a chart value
+        # is caller input, and a shell would interpret it.
+        command = ["helm", "install", release_name, chart_path, "-n", namespace, "--create-namespace"]
 
         if version:
-            command += f" --version {version}"
+            command += ["--version", version]
 
         if values_file := args.get("values_file"):
-            command += f" -f {shlex.quote(str(values_file))}"
+            command += ["-f", str(values_file)]
 
-        if extra_args:
-            command += " " + " ".join(extra_args)
+        command += Helm._extra_args_argv(extra_args)
 
-        process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        process = subprocess.Popen(command, shell=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         output, error = process.communicate()
 
         stderr = error.decode("utf-8").strip() if error else ""
@@ -70,6 +89,14 @@ class Helm:
             )
         else:
             logger.debug(stdout)
+
+    @staticmethod
+    def _extra_args_argv(extra_args: Sequence[str | Sequence[str]] | None) -> list[str]:
+        """Flatten `extra_args` into argv entries: a string is one argument, a sequence expands."""
+        argv: list[str] = []
+        for entry in extra_args or []:
+            argv += [entry] if isinstance(entry, str) else [*entry]
+        return argv
 
     @staticmethod
     def ensure_dependencies(chart_path: str):
@@ -134,8 +161,8 @@ class Helm:
             logger.debug(f"Release {release_name} does not exist. Skipping uninstall.")
             return
 
-        command = f"helm uninstall {release_name} -n {namespace}"
-        process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        command = ["helm", "uninstall", release_name, "-n", namespace]
+        process = subprocess.Popen(command, shell=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         output, error = process.communicate()
 
         stderr = error.decode("utf-8").strip() if error else ""
@@ -169,8 +196,8 @@ class Helm:
     @staticmethod
     def _release_status(release_name: str, namespace: str) -> bool | None:
         """Return whether a release exists, or None when Helm cannot check."""
-        command = f"helm list -n {namespace}"
-        process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        command = ["helm", "list", "-n", namespace]
+        process = subprocess.Popen(command, shell=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         output, error = process.communicate()
 
         if process.returncode != 0:
@@ -179,6 +206,210 @@ class Helm:
             return None
 
         return release_name in output.decode("utf-8")
+
+    @staticmethod
+    def requested_values_fingerprint(configs: dict) -> str:
+        """Fingerprint the values a caller asks Helm to install with.
+
+        The inputs are the ones the caller supplies: the chart reference and the requested
+        `version` first, then the values in the order `install` applies them: the base
+        `values.yaml` of a local chart, the `values_file` argument, then every `-f`/`--values`
+        file and every `--set`/`--set-string` pair in `extra_args`. A values file is loaded
+        and re-dumped with sorted keys, so key order and YAML formatting do not matter;
+        `--set` pairs are kept verbatim and in order. A remote chart has no local base file,
+        so only the overlays and pairs actually passed are covered; the chart's own defaults
+        stay outside the fingerprint.
+
+        The chart reference and the version are part of the fingerprint because Helm picks
+        the release content from them: a chart-version bump with unchanged values still has
+        to redeploy. A remote chart without a `version` is unpinned and records an empty
+        one, because the version Helm then resolves is unknown here.
+
+        An unreadable input is skipped with one warning instead of raising, and makes the
+        whole result `UNKNOWN_VALUES_FINGERPRINT`. That value is never recorded, so an
+        unreadable input leaves the fingerprint untrustworthy and forces the caller to
+        treat the request as a redeploy, which is the safe direction.
+        """
+        parts: list[str] = [f"chart:{configs.get('chart_path') or ''}@{configs.get('version') or ''}"]
+        if configs.get("chart_path") and not configs.get("remote_chart", False):
+            chart_values = Path(configs["chart_path"]).expanduser() / "values.yaml"
+            base = Helm._canonical_values_file(chart_values)
+            if base is None:
+                return UNKNOWN_VALUES_FINGERPRINT
+            parts.append(f"base:{base}")
+
+        if values_file := configs.get("values_file"):
+            canonical = Helm._canonical_values_file(Path(values_file).expanduser())
+            if canonical is None:
+                return UNKNOWN_VALUES_FINGERPRINT
+            parts.append(f"file:{canonical}")
+
+        extra = Helm._extra_arg_values_parts(configs.get("extra_args") or [])
+        if extra is None:
+            return UNKNOWN_VALUES_FINGERPRINT
+        parts += extra
+
+        return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _extra_arg_values_parts(extra_args: Sequence[str | Sequence[str]]) -> list[str] | None:
+        """Canonical parts from `extra_args`: one per values file and per `--set` pair, in order."""
+        argv = Helm._extra_args_argv(extra_args)
+
+        parts: list[str] = []
+        index = 0
+        while index < len(argv):
+            argument = argv[index]
+            index += 1
+            if argument in {"-f", "--values"}:
+                if index == len(argv):
+                    break
+                value = argv[index]
+                index += 1
+            elif argument.startswith("--values="):
+                value = argument.split("=", 1)[1]
+            else:
+                value = None
+
+            if value is not None:
+                canonical = Helm._canonical_values_file(Path(value).expanduser())
+                if canonical is None:
+                    return None
+                parts.append(f"file:{canonical}")
+            elif argument in {"--set", "--set-string"}:
+                if index == len(argv):
+                    break
+                parts.append(f"{argument}:{argv[index]}")
+                index += 1
+            elif argument.startswith(("--set=", "--set-string=")):
+                parts.append(argument)
+        return parts
+
+    @staticmethod
+    def _canonical_values_file(path: Path) -> str | None:
+        """Load a values file and re-dump it with sorted keys, or None when it is unreadable."""
+        try:
+            with path.open() as file:
+                return json.dumps(yaml.safe_load(file) or {}, sort_keys=True)
+        except (OSError, yaml.YAMLError, TypeError, ValueError) as error:
+            logger.warning(f"Helm values file {path} is unreadable ({error}); its values are not fingerprinted")
+            return None
+
+    @staticmethod
+    def record_values_fingerprint(configs: dict) -> None:
+        """Record the fingerprint of the values an install used, on the release's own secrets.
+
+        A failure only costs a future redeploy, because a release without a trustworthy
+        fingerprint is never reused, so it is logged as a warning and never raised.
+        """
+        release_name = configs.get("release_name")
+        namespace = configs.get("namespace")
+        if not release_name or not namespace:
+            logger.warning("Cannot record a values fingerprint without a release name and a namespace")
+            return
+
+        fingerprint = Helm.requested_values_fingerprint(configs)
+        if fingerprint == UNKNOWN_VALUES_FINGERPRINT:
+            logger.warning(f"Not recording a values fingerprint for release {release_name}: its values are unreadable")
+            return
+
+        command = [
+            "kubectl",
+            "annotate",
+            "secret",
+            "-n",
+            namespace,
+            "-l",
+            f"owner=helm,name={release_name}",
+            f"{VALUES_FINGERPRINT_ANNOTATION}={fingerprint}",
+            "--overwrite",
+        ]
+        try:
+            result = subprocess.run(
+                command, check=False, capture_output=True, text=True, timeout=FINGERPRINT_COMMAND_TIMEOUT
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            logger.warning(f"Could not record the values fingerprint of release {release_name}: {error}")
+            return
+        if result.returncode != 0:
+            logger.warning(
+                f"Could not record the values fingerprint of release {release_name}: {result.stderr.strip()}"
+            )
+
+    @staticmethod
+    def release_values_fingerprint(release_name: str, namespace: str) -> str | None:
+        """Read the recorded values fingerprint of an installed release, or None when absent."""
+        command = [
+            "kubectl",
+            "get",
+            "secret",
+            "-n",
+            namespace,
+            "-l",
+            f"owner=helm,name={release_name}",
+            "-o",
+            "json",
+        ]
+        try:
+            result = subprocess.run(
+                command, check=False, capture_output=True, text=True, timeout=FINGERPRINT_COMMAND_TIMEOUT
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if result.returncode != 0:
+            return None
+        try:
+            items = json.loads(result.stdout).get("items") or []
+        except (AttributeError, ValueError):
+            return None
+
+        recorded: tuple[int, str] | None = None
+        for item in items:
+            metadata = item.get("metadata") or {}
+            fingerprint = (metadata.get("annotations") or {}).get(VALUES_FINGERPRINT_ANNOTATION)
+            if not fingerprint:
+                continue
+            try:
+                version = int((metadata.get("labels") or {}).get("version", 0))
+            except (TypeError, ValueError):
+                version = 0
+            if recorded is None or version > recorded[0]:
+                recorded = (version, fingerprint)
+        return recorded[1] if recorded else None
+
+    @staticmethod
+    def release_matches_requested_values(configs: dict) -> bool:
+        """Whether the installed release was installed with exactly the values this config asks for.
+
+        False means "redeploy", which is always safe; True only means the recorded and the
+        requested fingerprint are equal. The comparison never raises, so a cluster that
+        cannot answer costs a redeploy instead of a failure.
+        """
+        release_name = configs.get("release_name")
+        namespace = configs.get("namespace")
+        try:
+            if not release_name or not namespace:
+                logger.warning("Cannot compare release values without a release name and a namespace; redeploying")
+                return False
+            if not Helm.exists_release(release_name, namespace):
+                logger.warning(f"Release {release_name} in {namespace} does not exist; redeploying")
+                return False
+            recorded = Helm.release_values_fingerprint(release_name, namespace)
+            if recorded is None:
+                logger.warning(f"Release {release_name} in {namespace} has no readable values fingerprint; redeploying")
+                return False
+            requested = Helm.requested_values_fingerprint(configs)
+            if requested == UNKNOWN_VALUES_FINGERPRINT:
+                logger.warning(f"The values requested for release {release_name} are unreadable; redeploying")
+                return False
+            if recorded != requested:
+                logger.info(f"Release {release_name} in {namespace} was installed with other values; redeploying")
+                return False
+            return True
+        # A redeploy is always safe, a silent reuse of other values is not.
+        except Exception as error:
+            logger.warning(f"Cannot compare the values of release {release_name} in {namespace} ({error}); redeploying")
+            return False
 
     @staticmethod
     def assert_if_deployed(namespace: str):
@@ -273,10 +504,10 @@ class Helm:
             RuntimeError: If all retry attempts fail
         """
         logger.info(f"Helm Repo Add: {name} with url {url}")
-        command = f"helm repo add {name} {url}"
+        command = ["helm", "repo", "add", name, url]
 
         for attempt in range(max_retries):
-            process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            process = subprocess.Popen(command, shell=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             output, error = process.communicate()
 
             # Check if the repo add was successful (return code 0) or repo already exists
@@ -320,10 +551,10 @@ class Helm:
             RuntimeError: If all retry attempts fail
         """
         logger.info("Helm Repo Update with retry logic")
-        command = "helm repo update"
+        command = ["helm", "repo", "update"]
 
         for attempt in range(max_retries):
-            process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            process = subprocess.Popen(command, shell=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             output, error = process.communicate()
 
             if process.returncode == 0:

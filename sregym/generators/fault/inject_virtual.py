@@ -16,6 +16,7 @@ from sregym.paths import CACHE_DIR, SOCIAL_NETWORK_IMAGE_VALUES, TARGET_MICROSER
 from sregym.service.helm import Helm
 from sregym.service.kubectl import KubeCtl
 from sregym.service.rollout import deployment_rollout_complete
+from sregym.storage import get_storage_class
 
 DAEMON_SET_RECOVERY_STATE_DIR = CACHE_DIR / "daemon_set_recovery"
 
@@ -1725,7 +1726,11 @@ class VirtualizationFaultInjector(FaultInjector):
                 "apiVersion": "v1",
                 "kind": "PersistentVolumeClaim",
                 "metadata": {"name": pvc_name, "namespace": self.namespace},
-                "spec": {"accessModes": ["ReadWriteOnce"], "resources": {"requests": {"storage": "1Gi"}}},
+                "spec": {
+                    "accessModes": ["ReadWriteOnce"],
+                    "storageClassName": get_storage_class(),
+                    "resources": {"requests": {"storage": "1Gi"}},
+                },
             }
 
             pvc_json = json.dumps(pvc_manifest)

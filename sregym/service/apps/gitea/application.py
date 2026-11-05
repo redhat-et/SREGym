@@ -15,6 +15,7 @@ from sregym.service.apps.helpers import get_frontend_url
 from sregym.service.apps.persistent import cleanup_persistent_namespace
 from sregym.service.apps.postgres import POSTGRES_IMAGE, TIERS
 from sregym.service.kubectl import KubeCtl
+from sregym.storage import get_storage_class
 
 GITEA_IMAGE = "gitea/gitea:1.27.3"
 FIXTURES = Path(__file__).with_name("fixtures") / "gitea-zoo"
@@ -24,13 +25,13 @@ class GiteaApplication(KubernetesCommands, Application):
     app_id = "gitea"
     metadata_file = Path(__file__).with_name("metadata.json")
 
-    def __init__(self, tier="replicated", storage_class="openebs-hostpath"):
+    def __init__(self, tier="replicated", storage_class=None):
         if tier not in TIERS:
             raise ValueError(f"Unknown Gitea tier {tier!r}; choose from {tuple(TIERS)}")
         super().__init__(self.metadata_file)
         self.scale_tier = tier
         self.members = TIERS[tier]
-        self.storage_class = storage_class
+        self.storage_class = storage_class or get_storage_class()
         self.load_app_json()
         self.kubectl = KubeCtl()
         self.frontend_service = "gitea"

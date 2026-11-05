@@ -11,6 +11,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from sregym import storage
 from sregym.conductor.problems.wrong_service_selector import WrongServiceSelector
 from sregym.service.apps.components.http_client import Client
 from sregym.service.apps.gitlab.application import GitLabApplication
@@ -18,6 +19,7 @@ from sregym.service.apps.gitlab.recovery import GitLabRecoveryApplication
 from sregym.service.apps.mattermost.application import MattermostApplication
 from sregym.service.apps.mattermost.workflow import workflow as mattermost_workflow
 from sregym.service.apps.stripe.application import StripeApplication
+from sregym.storage import get_storage_class
 
 
 @pytest.mark.parametrize("cls", [GitLabApplication, MattermostApplication, StripeApplication])
@@ -28,7 +30,7 @@ def test_persistent_topology_and_secret_references(cls, tier, members):
     pg = next(d for d in docs if d["kind"] == "Cluster")["spec"]
     assert pg["instances"] == members
     assert 0 < pg["smartShutdownTimeout"] < pg["stopDelay"] < 180
-    assert pg["storage"]["storageClass"] == "openebs-hostpath"
+    assert pg["storage"]["storageClass"] == get_storage_class()
     if members > 1:
         assert pg["postgresql"]["synchronous"]["dataDurability"] == "required"
     assert sum(d["kind"] == "PersistentVolumeClaim" for d in docs) + members == app.expected_volume_count
@@ -38,6 +40,18 @@ def test_persistent_topology_and_secret_references(cls, tier, members):
     assert deployment["spec"]["strategy"]["type"] == "Recreate"
     assert "secretKeyRef" in json.dumps(deployment)
     assert not deployment["spec"]["template"]["spec"]["automountServiceAccountToken"]
+
+
+@pytest.mark.parametrize("cls", [GitLabApplication, MattermostApplication, StripeApplication])
+def test_the_selected_storage_class_names_the_database_and_every_data_claim(cls, monkeypatch):
+    monkeypatch.setattr(storage, "_storage_class", "gp3")
+    app = cls("replicated")
+    docs = app.render()
+    pg = next(d for d in docs if d["kind"] == "Cluster")["spec"]
+    claims = [d for d in docs if d["kind"] == "PersistentVolumeClaim"]
+    assert pg["storage"]["storageClass"] == "gp3"
+    assert len(claims) == len(app.data_volumes)
+    assert all(claim["spec"]["storageClassName"] == "gp3" for claim in claims)
 
 
 @pytest.mark.parametrize(

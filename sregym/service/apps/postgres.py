@@ -11,6 +11,7 @@ from sregym.service.apps.components.cnpg import PostgresCluster, ensure_operator
 from sregym.service.apps.components.kubernetes import KubernetesCommands
 from sregym.service.apps.persistent import cleanup_persistent_namespace
 from sregym.service.kubectl import KubeCtl
+from sregym.storage import get_storage_class
 
 POSTGRES_IMAGE = "ghcr.io/cloudnative-pg/postgresql:16.14-system-trixie"
 TIERS = {"single": 1, "replicated": 3}
@@ -26,11 +27,12 @@ class PostgresApplication(KubernetesCommands, Application):
     client_workflow: Path
     metadata_file: Path
 
-    def __init__(self, tier="replicated", storage_class="openebs-hostpath"):
+    def __init__(self, tier="replicated", storage_class=None):
         if tier not in TIERS:
             raise ValueError(f"Unsupported tier {tier!r}: choose {tuple(TIERS)}")
         super().__init__(self.metadata_file)
-        self.scale_tier, self.members, self.storage_class = tier, TIERS[tier], storage_class
+        self.scale_tier, self.members = tier, TIERS[tier]
+        self.storage_class = storage_class or get_storage_class()
         self.load_app_json()
         self.app_name = self.name
         self.description = self.get_app_json()["Desc"]

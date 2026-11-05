@@ -4,6 +4,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from sregym import storage
 from sregym.service.apps.deathstarbench.application import (
     LABEL,
     OPENRESTY_IMAGE,
@@ -13,6 +14,7 @@ from sregym.service.apps.deathstarbench.application import (
     member_hosts,
     mongo_resources,
 )
+from sregym.storage import get_storage_class
 
 
 @pytest.mark.parametrize("tier", SCALE_TIERS)
@@ -28,7 +30,7 @@ def test_hotel_renders_real_replica_sets_without_mutating_source(tier):
     for stateful in sets:
         assert stateful["spec"]["replicas"] == app.scale.members
         assert stateful["spec"]["volumeClaimTemplates"][0]["spec"]["accessModes"] == ["ReadWriteOnce"]
-        assert stateful["spec"]["volumeClaimTemplates"][0]["spec"]["storageClassName"] == "openebs-hostpath"
+        assert stateful["spec"]["volumeClaimTemplates"][0]["spec"]["storageClassName"] == get_storage_class()
         name = stateful["metadata"]["name"]
         service = next(d for d in docs if d["kind"] == "Service" and d["metadata"]["name"] == name)
         assert service["spec"]["selector"] == {LABEL: name}
@@ -50,6 +52,16 @@ def test_custom_storage_class_remains_supported(factory):
     assert all(
         document["spec"]["volumeClaimTemplates"][0]["spec"]["storageClassName"] == "custom-storage"
         for document in stateful_sets
+    )
+
+
+@pytest.mark.parametrize("factory", [ScaledHotelReservationApplication, ScaledSocialNetworkApplication])
+def test_the_default_storage_class_is_the_selected_one(factory, monkeypatch):
+    monkeypatch.setattr(storage, "_storage_class", "gp3")
+    stateful_sets = [document for document in factory().render() if document["kind"] == "StatefulSet"]
+    assert stateful_sets
+    assert all(
+        document["spec"]["volumeClaimTemplates"][0]["spec"]["storageClassName"] == "gp3" for document in stateful_sets
     )
 
 

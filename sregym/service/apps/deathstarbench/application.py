@@ -18,6 +18,7 @@ import yaml
 from sregym.paths import TARGET_MICROSERVICES
 from sregym.service.apps.hotel_reservation import HotelReservation
 from sregym.service.apps.social_network import SocialNetwork
+from sregym.storage import get_storage_class
 
 MONGO_IMAGE = "mongo:4.4.29"
 OPENRESTY_IMAGE = (
@@ -398,10 +399,10 @@ class ScaledHotelReservationApplication(ScaledApplication, HotelReservation):
     authenticated_databases = frozenset({"mongodb-geo", "mongodb-rate"})
     services = frozenset({"frontend", "geo", "profile", "rate", "recommendation", "reservation", "search", "user"})
 
-    def __init__(self, tier: str = "replicated", storage_class: str = "openebs-hostpath"):
+    def __init__(self, tier: str = "replicated", storage_class: str | None = None):
         tier_config(tier)
         super().__init__(mount_failure_scripts=False)
-        self.configure_scale(tier, storage_class)
+        self.configure_scale(tier, storage_class or get_storage_class())
 
     def is_application_service(self, name):
         return name in self.services
@@ -447,10 +448,10 @@ class ScaledHotelReservationApplication(ScaledApplication, HotelReservation):
 class ScaledSocialNetworkApplication(ScaledApplication, SocialNetwork):
     expected_databases = 6
 
-    def __init__(self, tier: str = "replicated", storage_class: str = "openebs-hostpath"):
+    def __init__(self, tier: str = "replicated", storage_class: str | None = None):
         tier_config(tier)
         super().__init__()
-        self.configure_scale(tier, storage_class)
+        self.configure_scale(tier, storage_class or get_storage_class())
 
     def is_application_service(self, name):
         return name.endswith("-service") or name in {"nginx-thrift", "media-frontend"}

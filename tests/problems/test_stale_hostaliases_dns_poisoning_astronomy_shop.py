@@ -7,12 +7,17 @@ inject -> oracle fails -> recover -> oracle passes lifecycle and is skipped
 unless `-m integration` is selected against a live cluster.
 """
 
+import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
+import yaml
 
+from sregym import profile
+from sregym.conductor.problems import stale_hostaliases_dns_poisoning_astronomy_shop as poison_module
 from sregym.conductor.problems.stale_hostaliases_dns_poisoning_astronomy_shop import (
     StaleHostAliasesDNSPoisoningAstronomyShop,
 )
@@ -135,6 +140,40 @@ def test_backend_hostname_matches_the_proxy_env_in_the_chart():
     """The alias only bites if it spells the host in FRONTEND_HOST exactly."""
     frontend_host = "frontend"  # values.yaml -> components.frontend-proxy.env
     assert frontend_host == StaleHostAliasesDNSPoisoningAstronomyShop.TARGET_BACKEND
+
+
+def test_deploy_app_passes_each_set_json_value_unquoted(tmp_path, monkeypatch):
+    """A `--set-json` value is one argv element, so quoting it would hand Helm the quotes."""
+    monkeypatch.setattr(profile, "_profile", None)
+    monkeypatch.delenv("SREGYM_PROFILE", raising=False)
+    chart = tmp_path / "chart"
+    chart.mkdir()
+    (chart / "values.yaml").write_text(
+        yaml.safe_dump({"components": {"flagd": {"sidecarContainers": [{"name": "flagd"}]}}})
+    )
+    problem = StaleHostAliasesDNSPoisoningAstronomyShop.__new__(StaleHostAliasesDNSPoisoningAstronomyShop)
+    problem.namespace = NAMESPACE
+    problem.app = SimpleNamespace(
+        helm_configs={"release_name": NAMESPACE, "namespace": NAMESPACE, "chart_path": str(chart)}
+    )
+    problem._ensure_trace_backend = lambda: None
+    problem._wait_trace_collector = lambda: None
+    problem.prepare_baseline = lambda: None
+    install = MagicMock()
+    monkeypatch.setattr(poison_module.Helm, "install", install)
+    monkeypatch.setattr(poison_module.Helm, "assert_if_deployed", MagicMock())
+    monkeypatch.setattr(poison_module, "Jaeger", MagicMock())
+
+    problem.deploy_app()
+
+    extra_args = install.call_args.kwargs["extra_args"]
+    set_json_values = [extra_args[index + 1] for index, arg in enumerate(extra_args) if arg == "--set-json"]
+    assert len(set_json_values) == 5
+    for value in set_json_values:
+        key, document = value.split("=", 1)
+        assert value == f"{key}={json.dumps(json.loads(document))}"
+        assert not value.startswith(("'", '"'))
+    assert any(" " in value for value in set_json_values)
 
 
 def test_problem_wires_hosts_mitigation_oracle_and_probe_method(monkeypatch):

@@ -5,6 +5,8 @@ import subprocess
 from sregym.paths import BASE_DIR, LOKI_METADATA
 from sregym.service.helm import Helm
 from sregym.service.kubectl import KubeCtl
+from sregym.service.telemetry.release_pvcs import delete_retained_pvcs
+from sregym.storage import get_storage_class, uses_openebs
 
 
 class Loki:
@@ -77,19 +79,40 @@ class Loki:
 
     def deploy(self):
         """Deploy Loki using Helm."""
-        if self._is_loki_running():
-            self.logger.warning("Loki is already running. Skipping redeployment.")
+        helm_configs = self._requested_helm_configs()
+        if self._is_loki_running() and Helm.release_matches_requested_values(helm_configs):
+            self.logger.info("Loki runs the requested values. Reusing the release.")
             self._deploy_promtail()
             return
 
+        self.logger.info("Loki does not run the requested values. Redeploying the release.")
         Helm.uninstall(**self.helm_configs)
+        self._delete_retained_pvcs()
 
         # Add Grafana Helm repo for Loki chart
         self._add_grafana_helm_repo()
 
-        Helm.install(**self.helm_configs)
+        Helm.install(**helm_configs)
+        Helm.record_values_fingerprint(helm_configs)
         Helm.assert_if_deployed(self.namespace)
         self._deploy_promtail()
+
+    def _requested_helm_configs(self) -> dict:
+        """The Helm config of this deployment: the metadata config plus the requested class."""
+        helm_configs = dict(self.helm_configs)
+        if not uses_openebs():
+            # The vendored values file names openebs-hostpath, which is the `kind`
+            # render input. Any other class is passed over it, unchanged.
+            helm_configs["extra_args"] = [
+                *helm_configs.get("extra_args", []),
+                "--set-string",
+                f"singleBinary.persistence.storageClass={get_storage_class()}",
+            ]
+        return helm_configs
+
+    def _delete_retained_pvcs(self) -> None:
+        """Remove Loki PVCs that Helm intentionally retains on uninstall."""
+        delete_retained_pvcs(self.namespace, self.helm_configs["release_name"])
 
     def _add_grafana_helm_repo(self):
         """Add Grafana Helm repository for Loki chart."""
@@ -117,19 +140,25 @@ class Loki:
         return False
 
     def _deploy_promtail(self):
-        if self._is_promtail_running():
-            self.logger.warning("Promtail is already running. Skipping redeployment.")
+        helm_configs = self._promtail_helm_configs()
+        if self._is_promtail_running() and Helm.release_matches_requested_values(helm_configs):
+            self.logger.info("Promtail runs the requested values. Skipping redeployment.")
             return
 
         self.logger.info("Deploying Promtail for Loki log collection...")
-        Helm.install(
-            release_name=self.promtail_release_name,
-            chart_path="grafana/promtail",
-            namespace=self.namespace,
-            remote_chart=True,
-            extra_args=["-f", self.promtail_values_file],
-        )
+        Helm.install(**helm_configs)
+        Helm.record_values_fingerprint(helm_configs)
         Helm.assert_if_deployed(self.namespace)
+
+    def _promtail_helm_configs(self) -> dict:
+        """The Helm config of this deployment: the Promtail chart and its values file."""
+        return {
+            "release_name": self.promtail_release_name,
+            "chart_path": "grafana/promtail",
+            "namespace": self.namespace,
+            "remote_chart": True,
+            "extra_args": ["-f", self.promtail_values_file],
+        }
 
     def _is_promtail_running(self) -> bool:
         """Check if Promtail is already running in the cluster."""

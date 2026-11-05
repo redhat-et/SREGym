@@ -5,9 +5,11 @@ from unittest.mock import Mock
 
 import pytest
 
+from sregym import storage
 from sregym.service.apps.gitea import workflow as workload
 from sregym.service.apps.gitea.application import GiteaApplication
 from sregym.service.apps.persistent import cleanup_persistent_namespace
+from sregym.storage import get_storage_class
 
 
 def test_agent_application_endpoint_exposes_gitea_and_its_tier(monkeypatch):
@@ -27,7 +29,7 @@ def test_tiers_keep_one_repository_writer_and_use_dedicated_database_storage(tie
     database = next(d for d in documents if d["kind"] == "Cluster")["spec"]
     application = next(d for d in documents if d["kind"] == "Deployment")["spec"]
     assert database["instances"] == members
-    assert database["storage"] == {"size": "2Gi", "storageClass": "openebs-hostpath"}
+    assert database["storage"] == {"size": "2Gi", "storageClass": get_storage_class()}
     assert application["replicas"] == 1
     assert application["strategy"]["type"] == "Recreate"
     assert application["template"]["spec"]["volumes"][0]["persistentVolumeClaim"]["claimName"] == "gitea-repositories"
@@ -36,6 +38,18 @@ def test_tiers_keep_one_repository_writer_and_use_dedicated_database_storage(tie
         assert database["postgresql"]["synchronous"]["number"] == 1
     else:
         assert "synchronous" not in database["postgresql"]
+
+
+@pytest.mark.parametrize("storage_class", ["gp3", "standard"])
+def test_the_selected_storage_class_names_the_database_and_the_repository_volume(storage_class, monkeypatch):
+    monkeypatch.setattr(storage, "_storage_class", storage_class)
+    documents = GiteaApplication("replicated").render()
+    database = next(d for d in documents if d["kind"] == "Cluster")["spec"]
+    repositories = next(
+        d for d in documents if d["kind"] == "PersistentVolumeClaim" and d["metadata"]["name"] == "gitea-repositories"
+    )["spec"]
+    assert database["storage"] == {"size": "2Gi", "storageClass": storage_class}
+    assert repositories["storageClassName"] == storage_class
 
 
 def test_cleanup_waits_only_for_owned_reclaimable_volumes():
