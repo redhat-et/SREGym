@@ -10,8 +10,8 @@ from kubernetes import client
 
 from sregym.generators.fault.base import FaultInjector
 from sregym.service.kubectl import KubeCtl
-from sregym.service.runtime_images import KAFKA_CLIENT_IMAGE
 from sregym.service.rollout import deployment_rollout_complete
+from sregym.service.runtime_images import KAFKA_CLIENT_IMAGE
 
 logger = logging.getLogger("all.sregym.inject_kafka")
 logger.propagate = True
