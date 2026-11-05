@@ -190,6 +190,7 @@ def test_main_sets_custom_k8s_port_before_agent_preflight(monkeypatch):
         container_hardening="on",
         use_external_harness=False,
         profile="full",
+        platform="kind",
         noise=False,
         force_build=False,
         stages=None,

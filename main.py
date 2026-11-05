@@ -27,6 +27,7 @@ from clients.jev.config import configure as configure_jev
 from logger import console, init_logger
 from sregym.agent_launcher import AgentLauncher
 from sregym.agent_registry import get_agent, list_agents
+from sregym.cluster_platform import KIND, PLATFORMS, PlatformVerificationError, set_platform
 from sregym.conductor.conductor import ALL_STAGES, Conductor, ConductorConfig
 from sregym.conductor.conductor_api import request_shutdown, run_api
 from sregym.conductor.problem_sets import PROBLEM_SETS
@@ -296,13 +297,20 @@ def driver_loop(
             # so do not let stale local-run state affect them.
             conductor.clear_cluster_egress_boundary()
         else:
-            available_agents = list_agents(path=Path(os.path.dirname(os.path.abspath(__file__))) / "agents.yaml").keys()
-            if agent_to_run not in available_agents:
-                console.log(f"⚠️ Agent '{agent_to_run}' not found in registry. Available agents: {available_agents}")
+            agents = list_agents(path=Path(os.path.dirname(os.path.abspath(__file__))) / "agents.yaml")
+            if agent_to_run not in agents:
+                console.log(f"⚠️ Agent '{agent_to_run}' not found in registry. Available agents: {list(agents)}")
                 sys.exit(1)
 
             console.log(f"Starting agent now: {agent_to_run}")
-            conductor.register_agent(agent_to_run)
+            # An agent registered with container_isolation: false runs on the host, so it
+            # launches no container and must not make the dependency list demand docker.
+            registration = agents.get(agent_to_run)
+            conductor.register_agent(
+                agent_to_run,
+                # A registration that does not state the flag is the old behaviour: a container launch.
+                container_isolation=getattr(registration, "container_isolation", True),
+            )
 
             # Start K8s API proxy to hide chaos engineering namespaces from the agent
             console.log("🔒 Starting Kubernetes API proxy to hide chaos namespaces...")
@@ -451,6 +459,9 @@ def driver_loop(
                 max_deploy_retries = 3
                 result = None
                 deploy_cleanup_failed = False
+                # A platform refusal says this cluster must not be touched at all, so the
+                # attempt ends without recovery or teardown.
+                cluster_untouched = False
                 for deploy_attempt in range(1, max_deploy_retries + 1):
                     check_interrupted()
                     try:
@@ -465,6 +476,16 @@ def driver_loop(
                             console.log(
                                 "⛔ Image platform failures require a compatible image; skipping deploy retries"
                             )
+                            break
+                        if isinstance(e, PlatformVerificationError):
+                            # A refusal is a decision about the cluster, not a transient deploy
+                            # failure: retrying and cleaning up would be the destructive work the
+                            # check just refused.
+                            console.log(
+                                "⛔ The declared platform is not confirmed by this cluster; stopping here "
+                                "without retrying or cleaning up"
+                            )
+                            cluster_untouched = True
                             break
                         if deploy_attempt < max_deploy_retries:
                             console.log("🧹 Cleaning up before retry...")
@@ -487,7 +508,7 @@ def driver_loop(
                     # The inner retry loop already logged the failure. Don't crash the
                     # entire driver — record the failure, clean up cluster state, and
                     # move on to the next problem so the benchmark can keep making progress.
-                    if not deploy_cleanup_failed:
+                    if not deploy_cleanup_failed and not cluster_untouched:
                         deploy_cleanup_failed = not await finish_problem_with_deadline(
                             "cleanup_timeout_after_deploy_failure"
                         )
@@ -911,6 +932,8 @@ def _run_benchmark(args, *, judge_backend: str = "api", agent_image: str | None 
     _driver_results = []
 
     agent_model, judge_model = _configure_model_environment(args)
+    # The platform has to be known before anything derives behaviour from it.
+    set_platform(args.platform)
     internet_policy = InternetPolicy.from_mode(
         args.internet_access,
         agent_name=args.agent,
@@ -1202,6 +1225,16 @@ if __name__ == "__main__":
             "bundled OpenSearch/Grafana/Jaeger, Prometheus Alertmanager/Pushgateway, the OpenEBS NDM "
             "stack — and shortens metric retention. 'svelte' changes what an agent can observe, so "
             "its results are not comparable with 'full'."
+        ),
+    )
+    parser.add_argument(
+        "--platform",
+        choices=PLATFORMS,
+        default=os.environ.get("SREGYM_PLATFORM", KIND),
+        help=(
+            "Cluster platform. 'kind' (default) is a local kind cluster. 'openshift' is a managed "
+            "OpenShift cluster: the harness then skips installing cluster-wide components (such as the "
+            "metrics API) the platform already provides."
         ),
     )
     parser.add_argument(

@@ -24,6 +24,7 @@ from kubernetes.client import api_client  # noqa: E402
 from kubernetes.client.rest import ApiException  # noqa: E402
 
 from logger import console  # noqa: E402
+from sregym.cluster_platform import restricted_admission  # noqa: E402
 
 WAIT_FOR_POD_READY_TIMEOUT = int(os.getenv("WAIT_FOR_POD_READY_TIMEOUT", "600"))
 NETWORK_PROBE_TIMEOUT = int(os.getenv("SREGYM_NETWORK_PROBE_TIMEOUT", "60"))
@@ -35,6 +36,12 @@ PLATFORM_ERROR_MARKERS = (
     "no match for platform in manifest",
     "running an x86 program on an arm64 os",
 )
+
+
+def _one_line(text, limit: int = 300) -> str:
+    """Collapse ``text`` to one bounded line, so it can sit inside an error message."""
+    collapsed = " ".join(str(text or "").split())
+    return collapsed if len(collapsed) <= limit else collapsed[: limit - 3] + "..."
 
 
 class ContainerPlatformError(RuntimeError):
@@ -55,6 +62,7 @@ class KubeCtl:
             exit(1)
         self.core_v1_api = client.CoreV1Api()
         self.apps_v1_api = client.AppsV1Api()
+        self.apis_api = client.ApisApi()
 
     def list_namespaces(self):
         """Return a list of all namespaces in the cluster."""
@@ -120,7 +128,29 @@ class KubeCtl:
                         restart_policy="Never",
                         tolerations=[client.V1Toleration(operator="Exists")],
                         automount_service_account_token=False,
-                        containers=[client.V1Container(name="pause", image=image, image_pull_policy="IfNotPresent")],
+                        security_context=client.V1PodSecurityContext(
+                            run_as_non_root=True,
+                            seccomp_profile=client.V1SeccompProfile(type="RuntimeDefault"),
+                        ),
+                        containers=[
+                            client.V1Container(
+                                name="pause",
+                                image=image,
+                                image_pull_policy="IfNotPresent",
+                                security_context=client.V1SecurityContext(
+                                    run_as_non_root=True,
+                                    # `pause` declares no non-root USER, so `run_as_non_root` alone makes the
+                                    # kubelet refuse it and a numeric uid has to be pinned. Under restricted
+                                    # admission the SCC assigns a uid from the namespace's uid range and
+                                    # refuses a pod that pins one, so the uid is only set where admission
+                                    # does not restrict it.
+                                    run_as_user=None if restricted_admission() else 65535,
+                                    allow_privilege_escalation=False,
+                                    seccomp_profile=client.V1SeccompProfile(type="RuntimeDefault"),
+                                    capabilities=client.V1Capabilities(drop=["ALL"]),
+                                ),
+                            )
+                        ],
                     ),
                 )
                 # A timed-out create may still reach the server. Include it in cleanup.
@@ -196,6 +226,66 @@ class KubeCtl:
             except Exception as exc:
                 details.append(f"{name}: warning events unavailable ({exc})")
         return f"Pod sandbox preflight did not reach Ready with an IP within {timeout}s: {'; '.join(details)}"
+
+    def metrics_api_answers(self) -> bool:
+        """Return True when the cluster serves the resource metrics API.
+
+        This asks the cluster, not the harness, so the answer is usable on a
+        platform that serves metrics.k8s.io itself and must never have a
+        metrics-server installed over it. ``exec_command`` returns stderr text
+        instead of raising on failure, so an unparseable body means False.
+        """
+        return self._metrics_api_parses(self._metrics_api_raw())
+
+    def _metrics_api_raw(self) -> str:
+        """Return the cluster's raw answer to a metrics.k8s.io request.
+
+        The text is stderr on failure, which is the only place the reason for a
+        refusal survives: a 403 for a restricted identity and an APIService that
+        is still starting both look like "no metrics API" when reduced to a bool.
+        """
+        return self.exec_command("kubectl get --raw /apis/metrics.k8s.io/v1beta1/nodes --request-timeout=10s")
+
+    @staticmethod
+    def _metrics_api_parses(raw) -> bool:
+        """Return True when ``raw`` is a non-empty NodeMetricsList body."""
+        try:
+            metrics = json.loads(raw)
+        except (ValueError, TypeError):
+            return False
+        if not isinstance(metrics, dict) or metrics.get("kind") != "NodeMetricsList":
+            return False
+        items = metrics.get("items")
+        return isinstance(items, list) and bool(items)
+
+    def wait_for_metrics_api(self, timeout: int = WAIT_FOR_POD_READY_TIMEOUT, sleep: float = 2) -> None:
+        """Require the cluster to answer the resource metrics API before a run starts."""
+        deadline = time.monotonic() + timeout
+        raw = ""
+        while time.monotonic() < deadline:
+            raw = self._metrics_api_raw()
+            if self._metrics_api_parses(raw):
+                logger.info("Cluster serves metrics.k8s.io/v1beta1; no metrics-server install is needed.")
+                return
+            time.sleep(sleep)
+        raise RuntimeError(
+            "The cluster does not serve metrics.k8s.io/v1beta1, so per-pod and per-node resource usage is "
+            "unavailable. Check the cluster-monitoring route: OpenShift serves this API from the "
+            "openshift-monitoring namespace, and the harness must not install metrics-server over it. "
+            f"Last answer from the cluster: {_one_line(raw)}"
+        )
+
+    def openshift_api_present(self) -> bool:
+        """Return True when API discovery serves the OpenShift project and route groups.
+
+        One discovery call, and an absent group is the normal answer on a kind
+        cluster, so it must not look like an error in a run log. A refusal
+        propagates, so a caller that cannot see the groups learns that instead of
+        concluding "not OpenShift".
+        """
+        groups = self.apis_api.get_api_versions().groups or []
+        names = {group.name for group in groups}
+        return {"project.openshift.io", "route.openshift.io"} <= names
 
     def get_node_free_pct(self, node_name: str) -> int:
         """Return the nodefs free-space percentage as reported by kubelet stats summary."""

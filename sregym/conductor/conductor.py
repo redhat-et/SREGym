@@ -15,6 +15,13 @@ from pathlib import Path
 import yaml
 from kubernetes.client.rest import ApiException
 
+from sregym.cluster_platform import (
+    KIND,
+    get_platform,
+    is_openshift,
+    serves_metrics_api,
+    verify_platform_matches_cluster,
+)
 from sregym.conductor.constants import StartProblemResult
 from sregym.conductor.oracles.base import Oracle
 from sregym.conductor.oracles.detection import DetectionOracle
@@ -93,10 +100,12 @@ class Conductor:
         self.mcp_server = MCPServer(restrict_network_access=self.config.restrict_network_access)
         self.apps = AppRegistry()
         self.agent_name = None
+        self.agent_launches_container = False
 
         self.cluster_state = ClusterStateManager(self.kubectl)
         self.cluster_egress = ClusterEgressBoundary(self.kubectl)
         self._baseline_captured = False
+        self._platform_verified = False
 
         # Kubernetes API proxy to hide chaos engineering namespaces and load generators from agents
         self.k8s_proxy = KubernetesAPIProxy(
@@ -148,8 +157,15 @@ class Conductor:
             raise RuntimeError("No problem is loaded")
         return self.problem
 
-    def register_agent(self, name="agent"):
+    def register_agent(self, name="agent", *, container_isolation: bool = True):
+        """Record the agent this run drives, and whether it runs in a container.
+
+        ``container_isolation`` is the registration's flag, not an assumption: an
+        agent registered with ``container_isolation: false`` runs on the host, so no
+        container is launched for it and no container runtime is needed.
+        """
         self.agent_name = name
+        self.agent_launches_container = bool(container_isolation)
 
     def start_k8s_proxy(self):
         """
@@ -162,12 +178,50 @@ class Conductor:
         else:
             self.cluster_egress.stop()
         try:
+            if is_openshift():
+                self._hide_platform_namespaces()
             self.k8s_proxy.start()
             self._agent_kubeconfig_path = self.k8s_proxy.generate_agent_kubeconfig()
         except BaseException:
             self.cluster_egress.stop()
             raise
         self.logger.info(f"Agent kubeconfig generated at: {self._agent_kubeconfig_path}")
+
+    def _hide_platform_namespaces(self) -> None:
+        """Add the platform's own namespaces to what the proxy hides from the agent.
+
+        The names are read from the cluster instead of hard-coded, so a platform
+        namespace this harness has never heard of is hidden too. The assignment
+        makes a new set because the proxy copies the attribute into closure
+        locals in `start()`; replacing the attribute before `start()` is the only
+        thing that is visible to the running proxy.
+
+        This is not an authorization boundary. A request for a hidden namespace
+        gets 404 from the proxy, but the agent's MCP path does not pass through
+        this proxy at all, so what the agent can reach is decided elsewhere. That
+        is a recorded decision, not something this method changes.
+        """
+        try:
+            items = self.kubectl.list_namespaces().items
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not read the cluster's namespaces ({exc!r}), so the openshift*/kube-* namespaces cannot be "
+                "hidden from the agent. The proxy will not start with an unknown hidden set."
+            ) from exc
+        if not items:
+            raise RuntimeError(
+                "Could not read a single namespace from the cluster, so the openshift*/kube-* namespaces cannot be "
+                "hidden from the agent. The proxy will not start with an unknown hidden set."
+            )
+        platform_namespaces = {
+            item.metadata.name
+            for item in items
+            if item.metadata
+            and item.metadata.name
+            and (item.metadata.name.startswith("openshift") or item.metadata.name.startswith("kube-"))
+        }
+        self.k8s_proxy.hidden_namespaces = set(self.k8s_proxy.hidden_namespaces) | platform_namespaces
+        self.logger.info(f"[PROXY] Hiding {len(platform_namespaces)} openshift*/kube-* namespaces from the agent")
 
     def stop_k8s_proxy(self):
         """Stop the Kubernetes API proxy."""
@@ -190,6 +244,38 @@ class Conductor:
         This kubeconfig points to the filtering proxy that hides chaos namespaces.
         """
         return self._agent_kubeconfig_path
+
+    def verify_platform(self) -> None:
+        """Confirm the declared platform against cluster discovery, once per conductor.
+
+        Public because there are two entry points, not one: main.py through
+        start_problem, and tests/integration/validate_problem.py, which drives the
+        stages itself and never calls start_problem. main.py's retry loop calls
+        start_problem up to three times, so discovery runs once per conductor
+        rather than once per attempt. It cannot run in __init__: a unit test that
+        never touches a cluster still constructs a Conductor.
+        """
+        if self._platform_verified:
+            return
+        # Informational only, for logs and reports: behaviour is decided by the
+        # cluster_platform module predicates, never by reading this attribute.
+        self.platform = verify_platform_matches_cluster(self.kubectl.openshift_api_present, log=self.logger)
+        self._platform_verified = True
+
+    def required_binaries(self) -> list[str]:
+        """Return the host binaries this run needs on PATH.
+
+        kubectl and helm drive the cluster on every platform. docker is needed
+        only when the harness drives a local container runtime: the kind udev
+        preflight and the node-level injectors shell out to docker, and an agent
+        that is launched in a container is the other consumer. A validator run, or
+        an agent registered without container isolation, launches no container, so
+        a managed platform needs no Docker daemon on the runner host.
+        """
+        binaries = ["kubectl", "helm"]
+        if get_platform() == KIND or self.agent_launches_container:
+            binaries.append("docker")
+        return binaries
 
     def dependency_check(self, binaries: list[str]):
         for b in binaries:
@@ -697,8 +783,11 @@ class Conductor:
         self.app = self.problem.app
         self.detection_oracle = DetectionOracle(self.problem)
 
-        self.dependency_check(["kubectl", "helm", "docker"])
-        self.logger.debug("Dependency check passed: kubectl, helm")
+        self.verify_platform()
+
+        required_binaries = self.required_binaries()
+        self.dependency_check(required_binaries)
+        self.logger.debug(f"Dependency check passed: {', '.join(required_binaries)}")
 
         self.logger.info(f"[Session Start] Problem ID: {self.problem_id}")
         self.logger.info(f"[STAGE] Start testing on problem: {self.problem_id}")
@@ -1311,58 +1400,67 @@ class Conductor:
 
     def fix_kubernetes(self):
         self.logger.info("Fixing Kubernetes... to normal state.")
-        self.logger.info("[FIX] Imbalance leftover if any")
 
-        injector = VirtualizationFaultInjector(namespace="kube-system")
-        injector.recover_daemon_set_image_replacement(daemon_set_name="kube-proxy")
+        if is_openshift():
+            self.logger.info(
+                "[FIX] Skipping the distribution-specific repairs on this platform: the kube-proxy DaemonSet image "
+                "recovery, the kubelet crash recovery, the kubelet disk-pressure eviction leftovers, the Calico "
+                "IPPool/IPAMConfig reset, the Calico route-reflector label drift cleanup, and the CoreDNS NXDOMAIN "
+                "template recovery. They repair components a managed cluster does not run."
+            )
+        else:
+            self.logger.info("[FIX] Imbalance leftover if any")
 
-        self.logger.info("[FIX] KubeletCrash leftover if any")
-        injector = RemoteOSFaultInjector()
-        injector.recover_kubelet_crash()
+            injector = VirtualizationFaultInjector(namespace="kube-system")
+            injector.recover_daemon_set_image_replacement(daemon_set_name="kube-proxy")
 
-        self.logger.info("[FIX] KubeletEvictionThresholdMisconfig leftover if any")
-        injector.recover_disk_pressure_all()
-        # Delete Failed pods left by the eviction loop. Skip the app namespace
-        # because undeploy_app() tears down the application namespace anyway.
-        from sregym.conductor.problems.kubelet_eviction_threshold_misconfig import KubeletEvictionThresholdMisconfig
+            self.logger.info("[FIX] KubeletCrash leftover if any")
+            injector = RemoteOSFaultInjector()
+            injector.recover_kubelet_crash()
 
+            self.logger.info("[FIX] KubeletEvictionThresholdMisconfig leftover if any")
+            injector.recover_disk_pressure_all()
+
+            self.logger.info("[FIX] Calico IPPool/strictAffinity leftover if any")
+            try:
+                from sregym.conductor.problems.pod_cidr_exhaustion_hotel_reservation import (
+                    PodCIDRExhaustionHotelReservation,
+                )
+
+                kubectl = KubeCtl()
+                kubectl.exec_command(
+                    f"kubectl patch ippool {PodCIDRExhaustionHotelReservation.DEFAULT_POOL_NAME} --type=merge "
+                    '-p \'{"spec":{"disabled":false}}\''
+                )
+                kubectl.exec_command(
+                    'kubectl patch ipamconfig default --type=merge -p \'{"spec":{"strictAffinity":false}}\''
+                )
+                kubectl.exec_command(
+                    f"kubectl delete ippool {PodCIDRExhaustionHotelReservation.TINY_POOL_NAME} --ignore-not-found"
+                )
+                kubectl.exec_command(
+                    f"kubectl delete namespace {PodCIDRExhaustionHotelReservation.EXHAUST_NAMESPACE} --ignore-not-found"
+                )
+            except Exception as e:
+                self.logger.warning(f"Could not fix Calico IPPool state: {e}")
+
+            self._fix_calico_route_reflector_label_drift()
+
+            self.logger.info("[FIX] Stale CoreDNS NXDOMAIN templates if any")
+            injector = VirtualizationFaultInjector(namespace="kube-system")
+            try:
+                injector.recover_all_nxdomain_templates()
+            except Exception as e:
+                self.logger.error(f"Failed to recover CoreDNS NXDOMAIN templates: {e}")
+
+        # Delete Failed pods left by the eviction loop. SREGym can only delete
+        # Failed pods in a namespace it owns: the previous cluster-wide form
+        # reached other tenants' and platform namespaces, and deleting another
+        # tenant's pods is wrong on any cluster, so this is not platform-gated.
         self.kubectl.exec_command(
-            f"kubectl delete pods --all-namespaces "
-            f"--field-selector=status.phase=Failed,metadata.namespace!={KubeletEvictionThresholdMisconfig.NAMESPACE} "
-            "--ignore-not-found=true"
+            f"kubectl delete pods -n {self.current_problem.namespace} "
+            "--field-selector=status.phase=Failed --ignore-not-found=true"
         )
-
-        self.logger.info("[FIX] Calico IPPool/strictAffinity leftover if any")
-        try:
-            from sregym.conductor.problems.pod_cidr_exhaustion_hotel_reservation import (
-                PodCIDRExhaustionHotelReservation,
-            )
-
-            kubectl = KubeCtl()
-            kubectl.exec_command(
-                f"kubectl patch ippool {PodCIDRExhaustionHotelReservation.DEFAULT_POOL_NAME} --type=merge "
-                '-p \'{"spec":{"disabled":false}}\''
-            )
-            kubectl.exec_command(
-                'kubectl patch ipamconfig default --type=merge -p \'{"spec":{"strictAffinity":false}}\''
-            )
-            kubectl.exec_command(
-                f"kubectl delete ippool {PodCIDRExhaustionHotelReservation.TINY_POOL_NAME} --ignore-not-found"
-            )
-            kubectl.exec_command(
-                f"kubectl delete namespace {PodCIDRExhaustionHotelReservation.EXHAUST_NAMESPACE} --ignore-not-found"
-            )
-        except Exception as e:
-            self.logger.warning(f"Could not fix Calico IPPool state: {e}")
-
-        self._fix_calico_route_reflector_label_drift()
-
-        self.logger.info("[FIX] Stale CoreDNS NXDOMAIN templates if any")
-        injector = VirtualizationFaultInjector(namespace="kube-system")
-        try:
-            injector.recover_all_nxdomain_templates()
-        except Exception as e:
-            self.logger.error(f"Failed to recover CoreDNS NXDOMAIN templates: {e}")
 
         self.logger.info("[FIX] NightlyRebalanceOOM kube-system actor leftover if any")
         try:
@@ -1398,42 +1496,28 @@ class Conductor:
             self._baseline_captured = True
 
         self.logger.info("[DEPLOY] Checking Kubernetes pod networking…")
-        self.kubectl.assert_pod_networking()
-
-        self.logger.info("[DEPLOY] Setting up metrics-server…")
-        # metrics-server lives in kube-system, which is protected from
-        # reconciliation, so it survives between problems. Re-applying it fetches
-        # the manifest from GitHub every problem and rolls the deployment for no
-        # gain. The apply and the patch must be skipped together: the patch is an
-        # `add` to the args list, and running it without the apply that resets
-        # those args would append duplicates on every problem.
-        if self._metrics_server_configured():
-            self.logger.info("[DEPLOY] metrics-server already present and patched; skipping re-apply")
+        if is_openshift():
+            # Writing into kube-system is not ours on a managed platform, so the
+            # probe runs in the namespace this run owns.
+            self.kubectl.create_namespace_if_not_exist(problem.namespace)
+            self.logger.info(
+                f"[DEPLOY] Running the pod networking probe in SREGym's own namespace ({problem.namespace}); "
+                "writing into kube-system is not ours on this platform."
+            )
+            self.kubectl.assert_pod_networking(namespace=problem.namespace)
         else:
-            self.kubectl.exec_command(
-                "kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/"
-                "releases/latest/download/components.yaml"
-            )
-            self.kubectl.exec_command(
-                "kubectl -n kube-system patch deployment metrics-server "
-                "--type=json -p='["
-                '{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"},'
-                '{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-preferred-address-types=InternalIP"}'
-                "]'"
-            )
-            # Apply retains selector keys added outside the original manifest.
-            # Replace the complete selector so the Service reaches metrics-server.
-            self.kubectl.core_v1_api.patch_namespaced_service(
-                "metrics-server",
-                "kube-system",
-                [{"op": "replace", "path": "/spec/selector", "value": {"k8s-app": "metrics-server"}}],
-                _request_timeout=10,
-            )
-        self.kubectl.wait_for_ready("kube-system")
-        self._wait_for_infrastructure_ready("metrics-server", self._metrics_server_configured)
+            self.kubectl.assert_pod_networking(namespace="kube-system")
+
+        self._ensure_metrics_api()
 
         self.logger.info("[DEPLOY] Setting up OpenEBS…")
         svelte = is_svelte()
+        if is_openshift() and svelte:
+            self.logger.info(
+                "[DEPLOY] The OpenEBS block is not platform-gated yet (plan item 4): it runs on this platform "
+                "too. Once it is gated, `svelte` and `full` will differ here only by the Prometheus values "
+                "overlay."
+            )
         # `openebs` is protected from reconciliation, so it persists across
         # problems and the operator manifest only needs fetching once.
         if self._openebs_ready(svelte):
@@ -1529,6 +1613,48 @@ class Conductor:
         if self.problem:
             self.problem.app.cleanup()
 
+    def _ensure_metrics_api(self) -> None:
+        """Require a working metrics.k8s.io without replacing one the platform serves."""
+        if serves_metrics_api():
+            self.logger.info(
+                "[DEPLOY] The platform serves metrics.k8s.io itself; skipping components.yaml, whose APIService and "
+                "RBAC would replace the platform's own."
+            )
+            self.kubectl.wait_for_metrics_api()
+            return
+
+        self.logger.info("[DEPLOY] Setting up metrics-server…")
+        # metrics-server lives in kube-system, which is protected from
+        # reconciliation, so it survives between problems. Re-applying it fetches
+        # the manifest from GitHub every problem and rolls the deployment for no
+        # gain. The apply and the patch must be skipped together: the patch is an
+        # `add` to the args list, and running it without the apply that resets
+        # those args would append duplicates on every problem.
+        if self._metrics_server_configured():
+            self.logger.info("[DEPLOY] metrics-server already present and patched; skipping re-apply")
+        else:
+            self.kubectl.exec_command(
+                "kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/"
+                "releases/latest/download/components.yaml"
+            )
+            self.kubectl.exec_command(
+                "kubectl -n kube-system patch deployment metrics-server "
+                "--type=json -p='["
+                '{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"},'
+                '{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-preferred-address-types=InternalIP"}'
+                "]'"
+            )
+            # Apply retains selector keys added outside the original manifest.
+            # Replace the complete selector so the Service reaches metrics-server.
+            self.kubectl.core_v1_api.patch_namespaced_service(
+                "metrics-server",
+                "kube-system",
+                [{"op": "replace", "path": "/spec/selector", "value": {"k8s-app": "metrics-server"}}],
+                _request_timeout=10,
+            )
+        self.kubectl.wait_for_ready("kube-system")
+        self._wait_for_infrastructure_ready("metrics-server", self._metrics_server_configured)
+
     def _wait_for_infrastructure_ready(self, name: str, is_ready: Callable[[], bool], timeout: float = 180) -> None:
         """Require functional infrastructure, not just Ready surviving pods."""
         deadline = time.monotonic() + timeout
@@ -1603,14 +1729,7 @@ class Conductor:
             return False
         # A Ready Deployment does not prove that its Service and aggregated API
         # still work. Exercise the same API path used by kubectl top.
-        raw_metrics = self.kubectl.exec_command(
-            "kubectl get --raw /apis/metrics.k8s.io/v1beta1/nodes --request-timeout=10s"
-        )
-        try:
-            metrics = json.loads(raw_metrics)
-            return metrics.get("kind") == "NodeMetricsList" and bool(metrics.get("items"))
-        except (ValueError, TypeError, AttributeError):
-            return False
+        return self.kubectl.metrics_api_answers()
 
     def _openebs_ready(self, svelte: bool) -> bool:
         """True if the OpenEBS tier already matches what this profile wants.

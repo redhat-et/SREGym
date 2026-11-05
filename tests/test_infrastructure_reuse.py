@@ -8,6 +8,8 @@ import pytest
 import yaml
 from kubernetes.client.rest import ApiException
 
+from sregym import cluster_platform
+from sregym.cluster_platform import OPENSHIFT
 from sregym.conductor import conductor as conductor_module
 from sregym.conductor.conductor import Conductor
 from sregym.service import helm as helm_module
@@ -37,20 +39,14 @@ def conductor():
     return obj
 
 
-@pytest.mark.parametrize(
-    "response,healthy",
-    [
-        (json.dumps({"kind": "NodeMetricsList", "items": [{"metadata": {"name": "node"}}]}), True),
-        (json.dumps({"kind": "NodeMetricsList", "items": []}), False),
-        (json.dumps({"kind": "Status", "status": "Failure"}), False),
-        ("Error from server (ServiceUnavailable)", False),
-        ("null", False),
-    ],
-)
-def test_metrics_reuse_requires_the_functional_api(conductor, response, healthy):
-    conductor.kubectl.exec_command.side_effect = [" ".join(conductor._METRICS_SERVER_ARGS), "binding", response]
-    assert conductor._metrics_server_configured() is healthy
-    assert "--raw /apis/metrics.k8s.io/v1beta1/nodes" in conductor.kubectl.exec_command.call_args.args[0]
+@pytest.mark.parametrize("answers", [True, False])
+def test_metrics_reuse_requires_the_functional_api(conductor, answers):
+    """The API check itself lives in KubeCtl.metrics_api_answers; only delegation is tested here."""
+    conductor.kubectl.exec_command.side_effect = [" ".join(conductor._METRICS_SERVER_ARGS), "binding"]
+    conductor.kubectl.metrics_api_answers.return_value = answers
+
+    assert conductor._metrics_server_configured() is answers
+    conductor.kubectl.metrics_api_answers.assert_called_once_with()
 
 
 @pytest.mark.parametrize(
@@ -99,6 +95,12 @@ def test_new_ndm_without_status_is_not_reused(conductor):
 
 class ObserverSetupReached(Exception):
     pass
+
+
+@pytest.fixture(autouse=True)
+def reset_platform(monkeypatch):
+    monkeypatch.setattr(cluster_platform, "_platform", None)
+    monkeypatch.delenv("SREGYM_PLATFORM", raising=False)
 
 
 @pytest.fixture
@@ -159,12 +161,28 @@ def test_startup_repairs_ndm_scheduling_only_in_full(startup, monkeypatch, svelt
 def test_healthy_infrastructure_is_not_patched(startup):
     with pytest.raises(ObserverSetupReached):
         startup.deploy_app()
-    startup.kubectl.assert_pod_networking.assert_called_once_with()
+    startup.kubectl.assert_pod_networking.assert_called_once_with(namespace="kube-system")
     startup.kubectl.core_v1_api.patch_namespaced_service.assert_not_called()
     startup.kubectl.apps_v1_api.patch_namespaced_daemon_set.assert_not_called()
     assert startup._metrics_server_configured.call_count == 2
     assert startup._openebs_ready.call_count == 2
     startup._preload_openebs_helper_image.assert_called_once_with()
+
+
+def test_openshift_probes_the_networking_in_the_runs_own_namespace(startup, monkeypatch):
+    # Writing into kube-system is not ours on a managed platform, so the probe runs in
+    # the namespace this run owns, which therefore has to exist first.
+    monkeypatch.setenv("SREGYM_PLATFORM", OPENSHIFT)
+    startup.problem = SimpleNamespace(namespace="sregym-astronomy-shop")
+
+    with pytest.raises(ObserverSetupReached):
+        startup.deploy_app()
+
+    startup.kubectl.create_namespace_if_not_exist.assert_called_once_with("sregym-astronomy-shop")
+    startup.kubectl.assert_pod_networking.assert_called_once_with(namespace="sregym-astronomy-shop")
+    assert "kube-system" not in [
+        call.kwargs["namespace"] for call in startup.kubectl.assert_pod_networking.call_args_list
+    ]
 
 
 def test_networking_failure_stops_before_infrastructure_or_application(startup):

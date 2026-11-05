@@ -138,6 +138,7 @@ def test_main_image_selection_reuses_one_build(monkeypatch, backend, external, f
         internet_access="open",
         container_hardening="on",
         profile="full",
+        platform="kind",
         noise=False,
         stages=None,
         baseline=None,

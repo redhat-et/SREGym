@@ -2,6 +2,8 @@ import json
 from types import SimpleNamespace
 
 import sregym.conductor.conductor as conductor_module
+from sregym import cluster_platform
+from sregym.cluster_platform import KIND
 from sregym.conductor.conductor import Conductor
 from sregym.conductor.problems.calico_route_reflector_label_drift import (
     CalicoRouteReflectorLabelDriftHotelReservation,
@@ -219,10 +221,13 @@ def test_calico_route_reflector_global_cleanup_keeps_unowned_support_namespace(m
     assert f"kubectl delete bgppeer {problem.BGP_PEER_NAME} --ignore-not-found" in fake.commands
 
 
-def test_fix_kubernetes_keeps_kubelet_eviction_global_cleanup(monkeypatch):
+def test_fix_kubernetes_keeps_kubelet_eviction_cleanup(monkeypatch):
+    monkeypatch.setattr(cluster_platform, "_platform", None)
+    monkeypatch.setenv("SREGYM_PLATFORM", KIND)
     fake = _FakeKubeCtl({})
     conductor = _conductor(fake, monkeypatch)
     conductor.kubectl = fake
+    conductor.problem = SimpleNamespace(namespace="astronomy-shop")
     remote_calls = []
     calico_cleanup_calls = []
 
@@ -255,8 +260,7 @@ def test_fix_kubernetes_keeps_kubelet_eviction_global_cleanup(monkeypatch):
 
     assert remote_calls == ["recover_kubelet_crash", "recover_disk_pressure_all"]
     assert (
-        "kubectl delete pods --all-namespaces "
-        "--field-selector=status.phase=Failed,metadata.namespace!=astronomy-shop "
-        "--ignore-not-found=true"
+        "kubectl delete pods -n astronomy-shop --field-selector=status.phase=Failed --ignore-not-found=true"
     ) in fake.commands
+    assert not any("--all-namespaces" in command for command in fake.commands)
     assert calico_cleanup_calls == [True]

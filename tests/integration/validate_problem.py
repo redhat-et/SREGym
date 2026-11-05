@@ -19,11 +19,13 @@ Example:
 import argparse
 import json
 import logging
+import os
 import sys
 import time
 from pathlib import Path
 
 from logger import init_logger
+from sregym.cluster_platform import KIND, PLATFORMS, set_platform
 from sregym.conductor.conductor import Conductor, ConductorConfig
 from sregym.profile import PROFILES, set_profile
 
@@ -103,6 +105,7 @@ def validate(
     conductor = None
     injection_attempted = False
     recovery_verified = False
+    deployed = False
     try:
         conductor = Conductor(config=ConductorConfig(deploy_loki=deploy_loki))
 
@@ -132,10 +135,20 @@ def validate(
 
         # --- Deploy the application -------------------------------------------
         logger.info("[STAGE] Deploying application")
-        conductor.dependency_check(["kubectl", "helm", "docker"])
+        # Confirm the declared platform against the cluster before the first
+        # destructive step: this script drives the stages itself and never goes
+        # through start_problem, which is where main.py verifies it. A refusal is a
+        # one-line answer, not a traceback.
+        try:
+            conductor.verify_platform()
+        except RuntimeError as exc:
+            raise ValidationError(str(exc)) from exc
+        # The validator launches no agent container, so docker is only required when the platform is kind.
+        conductor.dependency_check(conductor.required_binaries())
         conductor.fix_kubernetes()
         conductor.undeploy_app()  # clear any leftovers from a previous run
         conductor.deploy_app()
+        deployed = True
         oracle.capture_baseline()
         stages["deploy"].status = PASS
         stages["deploy"].detail = f"`{problem.app.name}` deployed to namespace `{problem.namespace}`"
@@ -192,15 +205,20 @@ def validate(
             if conductor.problem is not None:
                 if injection_attempted and not recovery_verified:
                     cleanup_actions.append(("recover fault", conductor.problem.recover_fault))
-                cleanup_actions.extend(
-                    [
-                        ("remove application", conductor.problem.app.cleanup),
-                        (
-                            "wait for namespace deletion",
-                            lambda: conductor.kubectl.wait_for_namespace_deletion(conductor.problem.namespace),
-                        ),
-                    ]
-                )
+                # Before deploy_app() there is no application to remove: a refusal
+                # from verify_platform is answered before anything was deployed, so
+                # teardown there would act on a cluster the check just declared
+                # off-limits.
+                if deployed:
+                    cleanup_actions.extend(
+                        [
+                            ("remove application", conductor.problem.app.cleanup),
+                            (
+                                "wait for namespace deletion",
+                                lambda: conductor.kubectl.wait_for_namespace_deletion(conductor.problem.namespace),
+                            ),
+                        ]
+                    )
             cleanup_actions.extend(
                 [
                     ("stop MCP port forward", conductor.mcp_server.stop_port_forward),
@@ -270,6 +288,16 @@ def main():
     parser.add_argument("--summary", default="validation-summary.md", help="Path for the Markdown summary")
     parser.add_argument("--json-summary", type=Path, help="Optional machine-readable lifecycle results")
     parser.add_argument("--profile", choices=PROFILES, default="full")
+    parser.add_argument(
+        "--platform",
+        choices=PLATFORMS,
+        default=os.environ.get("SREGYM_PLATFORM", KIND),
+        help=(
+            "Cluster platform. 'kind' (default) is a local kind cluster. 'openshift' is a managed "
+            "OpenShift cluster: the harness then skips installing cluster-wide components the platform "
+            "already provides."
+        ),
+    )
     parser.add_argument("--with-loki", action="store_true", help="Also validate deployment of Loki and Promtail")
     parser.add_argument(
         "--inject-timeout",
@@ -293,6 +321,7 @@ def main():
 
     init_logger()
     set_profile(args.profile)
+    set_platform(args.platform)
     logger.info(f"Starting validation for problem: {args.problem}")
     start = time.time()
 
@@ -308,6 +337,7 @@ def main():
                 {
                     "problem": args.problem,
                     "profile": args.profile,
+                    "platform": args.platform,
                     "with_loki": args.with_loki,
                     "passed": passed,
                     "elapsed_seconds": round(elapsed, 2),

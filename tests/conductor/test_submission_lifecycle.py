@@ -53,6 +53,7 @@ def _conductor(diagnosis_evaluation=None, mitigation_evaluation=None) -> Conduct
     conductor._aborted_submission_generations = set()
     conductor._accepting_submissions = True
     conductor._attempt_closed = False
+    conductor._platform_verified = True
 
     async def advance(self, start_index=0):
         self.waiting_for_agent = False

@@ -157,6 +157,7 @@ def test_interrupt_stops_agent_before_driver_owned_teardown(monkeypatch):
         internet_access="open",
         container_hardening="on",
         profile="full",
+        platform="kind",
         noise=False,
         use_external_harness=False,
         force_build=False,
@@ -236,6 +237,7 @@ def test_judge_preflight_is_deferred_until_effective_stages_are_known(monkeypatc
         internet_access="open",
         container_hardening="on",
         profile="full",
+        platform="kind",
         noise=False,
         use_external_harness=external,
         stages=stages,
@@ -255,6 +257,35 @@ def test_cleanup_deadline_covers_namespace_deletion_and_honors_override(monkeypa
     monkeypatch.setenv("SREGYM_CLEANUP_DRAIN_TIMEOUT_S", "900")
     benchmark_main = _load_main_module()
     assert benchmark_main.CLEANUP_DRAIN_TIMEOUT_SECONDS == 900
+
+
+def test_driver_registers_the_agent_with_its_registry_container_isolation(monkeypatch, tmp_path):
+    # A registration with container_isolation: false launches no container, so the
+    # conductor must not treat the agent as a container launch.
+    benchmark_main = _load_main_module()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(benchmark_main.asyncio, "sleep", AsyncMock())
+    monkeypatch.setattr(benchmark_main, "get_profile", lambda: "full")
+    monkeypatch.setattr(
+        benchmark_main, "list_agents", lambda path: {"radar": SimpleNamespace(container_isolation=False)}
+    )
+    monkeypatch.setattr(benchmark_main.LAUNCHER, "set_agent_kubeconfig", Mock())
+    conductor = SimpleNamespace(
+        problems=Mock(get_problem_ids=Mock(return_value=["problem"])),
+        results={},
+        bind_phase_ledger=Mock(),
+        register_agent=Mock(),
+        start_k8s_proxy=Mock(),
+        stop_k8s_proxy=Mock(),
+        get_agent_kubeconfig_path=Mock(return_value="kubeconfig"),
+        start_problem=AsyncMock(side_effect=benchmark_main.ContainerPlatformError("no matching manifest")),
+        finish_problem_in_background=Mock(),
+        wait_for_submission_work=AsyncMock(),
+    )
+
+    benchmark_main.driver_loop(conductor, agent_to_run="radar")
+
+    conductor.register_agent.assert_called_once_with("radar", container_isolation=False)
 
 
 @pytest.mark.parametrize("platform_failure, expected_attempts", [(True, 1), (False, 3)])
