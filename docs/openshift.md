@@ -20,6 +20,34 @@ labelled `openshift` has to come from an OpenShift cluster.
 
 Every default stays as it is, so a `kind` result is unchanged and remains the baseline for comparison.
 
+### One temporary override, for local debugging only
+
+`SREGYM_ALLOW_UNVERIFIED_PLATFORM=1` lifts **only** the second refusal: it lets a run declared
+`openshift` proceed on a cluster that does not report the OpenShift APIs, which is how the OpenShift
+code paths were exercised on kind. It is a debugging aid with an expiry date — grep for
+`TEMPORARY_ESCAPE_HATCH` in `sregym/cluster_platform.py` — and a run started that way is **not** an
+OpenShift run: its result must never be reported as one.
+
+Two things to know:
+
+- It cannot weaken the dangerous direction. Declaring `kind` for a real OpenShift cluster is refused
+  unconditionally, and the check runs before any cluster write; the override is never consulted on
+  that path.
+- Unset it before touching a managed cluster. Left exported, it turns a misdirected
+  `--platform openshift` into a warning instead of a refusal, so OpenShift code paths would run
+  against whatever cluster your kubeconfig points at.
+
+## The storage class
+
+`--storage-class` must name the cluster's own class on OpenShift. The default names OpenEBS, and
+selecting OpenEBS applies an operator manifest from the internet: two CRDs, cluster-scoped RBAC, two
+StorageClasses and a privileged node-disk-manager DaemonSet. On a restricted cluster the privileged
+pods are refused, so the run would die *after* those cluster-scoped objects existed, and nothing in
+this harness removes them.
+
+So a run on OpenShift with the default class is refused before it writes anything. Naming
+`openebs-hostpath` yourself is allowed and only warns: it is then your call, not a forgotten flag.
+
 ## Comparability of results
 
 Filtered internet access needs Calico's `adminnetworkpolicy` tier, which OVN-Kubernetes does not
@@ -62,7 +90,7 @@ excluded one fails at inject on this platform rather than being refused upfront.
 
 | Scenario | Verdict | Reason |
 |---|---|---|
-| `cronjob_sidecar_blocks_completion_hotel_reservation` | fixable | The injected sidecar runs unqualified `busybox:1.36`. |
+| `cronjob_sidecar_blocks_completion_hotel_reservation` | fixable | The injected sidecar image is qualified now and everything else is namespaced; only a cluster run can move this verdict. |
 | `edge_request_filter_cpu_saturation` | fixable | The chart pins `runAsUser: 101`, which `restricted-v2` rejects. |
 | `network_policy_block` | fixable | A namespaced NetworkPolicy only. Passed on ROSA with in-place branch edits. |
 | `env_variable_shadowing_astronomy_shop` | fixable | The chart pins `runAsUser: 1001`, which `restricted-v2` rejects. |
@@ -77,7 +105,7 @@ excluded one fails at inject on this platform rather than being refused upfront.
 | `secret_rotation_stale_env_credentials_astronomy_shop` | fixable | Namespaced Secret, ConfigMap and env edits only. |
 | `unschedulable_incorrect_port_assignment` | fixable | A deliberate `nodeSelector` in the app namespace. It works the same. |
 | `duplicate_pvc_mounts_social_network` | fixable | The injector's PVC names no `storageClassName`, and RWO plus anti-affinity needs two or more workers. |
-| `rolling_update_misconfigured_social_network` | fixable | The injector writes `python:3.9-slim` and `busybox:1.36`, both unqualified. |
+| `rolling_update_misconfigured_social_network` | fixable | The injector writes only qualified image references now; only a cluster run can move this verdict. |
 | `search_rate_retry_collapse_hotel_reservation` | fixable | Env edits only. The load arrives through `kubectl port-forward`. |
 
 The `sregym-lite-ia` ports carry the verdict of the fault they were adapted from, and only the DNS fault
@@ -106,6 +134,41 @@ Two claims from the earlier readiness work are still unproven, and neither is en
 - **H17, the chart node-exporter's `hostPort` 9100** against the port OpenShift's own node-exporter
   holds. The overlay disables the chart's DaemonSet and records the reason; proving the collision needs
   a cluster.
+
+## Running it
+
+The three commands, in the order they earn their cost. Substitute the cluster's own storage class.
+
+```bash
+# 1. One scenario, end to end, and the platform preflights. Minutes, not a suite.
+#    The validator launches no agent container, so it takes no --internet-access.
+uv run python tests/integration/validate_problem.py --problem network_policy_block --profile full \
+  --platform openshift --storage-class <cluster default>
+
+# 2. The same, then a teardown and a verdict that checks both directions.
+uv run python tests/integration/validate_problem.py --problem network_policy_block --profile full \
+  --platform openshift --storage-class <cluster default> --teardown-observers
+
+# 3. The suite. 16 of the 17 scenarios run; the excluded one is named and skipped.
+uv run python main.py --suite sregym-lite --platform openshift --storage-class <cluster default> \
+  --internet-access open --teardown-observers --stages diagnosis mitigation --n-attempts 1
+```
+
+`--internet-access open` is required on the suite run because filtered access needs Calico's
+`adminnetworkpolicy` tier, which OVN-Kubernetes does not provide; it belongs to the agent run, which
+is the only place an agent container is launched.
+
+`--allow-unqualified-images` is only needed for the 11 unqualified references that live in the
+`SREGym-applications` submodule, which this branch does not touch; the refusal names them and
+waiving it is a logged decision, not a default.
+
+A suite run prints the platform summary first and then the skip, for example
+`Skipping service_dns_resolution_failure_social_network in sregym-lite: it cannot be expressed on
+this platform (...). The rest of the suite runs.` The reason it cannot is on this page's table and
+in the support entry.
+
+[operations.md](operations.md) covers the artifacts, the success criteria and the damage check —
+including what to do when the verdict is `damaged`.
 
 ## Where the measured facts come from
 

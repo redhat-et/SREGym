@@ -99,6 +99,8 @@ def validate(
     deploy_loki: bool = False,
     reconcile: str | None = None,
     allow_unqualified_images: bool = False,
+    teardown_observers: bool = False,
+    damage_json: Path = Path("damage.json"),
 ):
     """Run the full deploy/inject/recover lifecycle. Returns (passed, stages)."""
     stages = {
@@ -110,6 +112,11 @@ def validate(
         "oracle_pass": Stage("Oracle passes after recovery"),
         "cleanup": Stage("Clean up application and local port forwards"),
     }
+    if teardown_observers:
+        # Campaign-exit behaviour, which start_problem never reaches: the observer stack the
+        # run deployed, and the verdict on whether the run left the cluster as it found it.
+        stages["teardown"] = Stage("Remove the observer stack")
+        stages["damage"] = Stage("Cluster damage verdict")
 
     conductor = None
     injection_attempted = False
@@ -121,6 +128,7 @@ def validate(
                 deploy_loki=deploy_loki,
                 reconcile=reconcile,
                 allow_unqualified_images=allow_unqualified_images,
+                damage_verdict=teardown_observers,
             )
         )
 
@@ -255,6 +263,24 @@ def validate(
             "; ".join(cleanup_errors) if cleanup_errors else "application namespace and local port forwards removed"
         )
 
+        if teardown_observers and conductor is not None:
+            removed: tuple = ()
+            try:
+                removed = tuple(conductor.teardown_observers())
+                stages["teardown"].status = PASS
+                stages["teardown"].detail = (
+                    f"removed {len(removed)} object(s): " + ", ".join(removed)
+                    if removed
+                    else "nothing was left to remove"
+                )
+            except Exception as exc:  # noqa: BLE001 - report the failure, do not mask the run
+                stages["teardown"].status = FAIL
+                stages["teardown"].detail = str(exc)
+            damage = conductor.cluster_damage_verdict(deleted_by_us=removed)
+            damage.write(damage_json)
+            stages["damage"].status = PASS if damage.harmless else FAIL
+            stages["damage"].detail = damage.text().replace("\n", " ")
+
     return all(stage.status == PASS for stage in stages.values()), stages
 
 
@@ -347,6 +373,11 @@ def main():
     )
     parser.add_argument("--with-loki", action="store_true", help="Also validate deployment of Loki and Promtail")
     parser.add_argument(
+        "--teardown-observers",
+        action="store_true",
+        help="Remove the observer stack at the end and print the cluster damage verdict",
+    )
+    parser.add_argument(
         "--allow-unqualified-images",
         action="store_true",
         help=(
@@ -399,6 +430,8 @@ def main():
         deploy_loki=args.with_loki,
         reconcile=args.reconcile,
         allow_unqualified_images=args.allow_unqualified_images,
+        teardown_observers=args.teardown_observers,
+        damage_json=Path(args.summary).with_name("damage.json"),
     )
 
     elapsed = time.time() - start

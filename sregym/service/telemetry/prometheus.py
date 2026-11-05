@@ -106,8 +106,14 @@ class Prometheus:
         delete_retained_pvcs(self.namespace, self.helm_configs["release_name"])
 
     def teardown(self):
-        """Teardown the metric collector deployment."""
+        """Teardown the metric collector deployment and the volume Helm deliberately keeps.
+
+        `helm uninstall` removes the StatefulSet and leaves its claim, because the chart asks for
+        `persistentVolumeReclaimPolicy: Retain`. Without the second step an 8 GiB volume survives
+        every teardown, which is what the first campaign left behind.
+        """
         Helm.uninstall(**self.helm_configs)
+        self._delete_retained_pvcs()
 
     def _wait_for_namespace_termination(self):
         """Wait for namespace to be fully deleted if it's currently in Terminating state."""

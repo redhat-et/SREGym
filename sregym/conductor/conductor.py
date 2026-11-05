@@ -17,6 +17,8 @@ from kubernetes.client.rest import ApiException
 
 from sregym.cluster_platform import (
     KIND,
+    OPENSHIFT,
+    PlatformVerificationError,
     get_platform,
     is_openshift,
     serves_metrics_api,
@@ -55,16 +57,18 @@ from sregym.service.cluster_state import (
     RECONCILE_REPORT,
     ClusterStateManager,
 )
+from sregym.service.damage_report import DAMAGED, DamageReport, compare
 from sregym.service.image_preflight import find_unqualified
 from sregym.service.image_preflight import report as format_image_report
 from sregym.service.internet_policy import InternetPolicy
 from sregym.service.k8s_proxy import KubernetesAPIProxy
 from sregym.service.kubectl import WAIT_FOR_POD_READY_TIMEOUT, KubeCtl
 from sregym.service.mcp_server import MCPServer
+from sregym.service.owned_objects import OWNED_CLUSTER_SCOPED_KINDS, delete_owned_cluster_scoped, owned_names
 from sregym.service.rollout import deployment_rollout_complete
 from sregym.service.telemetry.loki import Loki
 from sregym.service.telemetry.prometheus import Prometheus
-from sregym.storage import OPENebs, get_storage_class, uses_openebs
+from sregym.storage import OPENebs, get_storage_class, storage_class_is_explicit, uses_openebs
 
 # The agent-facing stages, in the only order they can run. Shared with
 # `--stages`' choices so the CLI and the conductor cannot disagree about what
@@ -134,6 +138,10 @@ class ConductorConfig:
     # manifests it is about to apply. The preflight cannot know a cluster's short-name table,
     # so it refuses; this says "I know this one, proceed" and every finding is still logged.
     allow_unqualified_images: bool = False
+    # Keep a run-local baseline so the damage verdict can compare. Set when a run asks for a
+    # verdict; on OpenShift it is implied, because that platform is where a run must prove it
+    # left the cluster as it found it.
+    damage_verdict: bool = False
 
     @property
     def restrict_network_access(self) -> bool:
@@ -359,7 +367,63 @@ class Conductor:
         # Informational only, for logs and reports: behaviour is decided by the
         # cluster_platform module predicates, never by reading this attribute.
         self.platform = verify_platform_matches_cluster(self.kubectl.openshift_api_present, log=self.logger)
+        self._refuse_default_openebs_on_openshift()
         self._platform_verified = True
+
+    def _refuse_default_openebs_on_openshift(self) -> None:
+        """Stop a run that would install OpenEBS cluster-wide on a managed platform.
+
+        OpenEBS is the default storage class, and selecting it applies an operator
+        manifest fetched from the internet: two CRDs, cluster-scoped RBAC and two
+        StorageClasses, plus a privileged node-disk-manager DaemonSet. On a managed
+        cluster the privileged pods are refused, so the run dies *after* those
+        cluster-scoped objects exist, and nothing here removes them -- the teardown
+        removes what carries this harness's ownership label, and they carry none.
+        That is a leftover on somebody else's cluster, so a forgotten --storage-class
+        is a refusal rather than a deploy.
+
+        A class named outright is the operator's call, and it is only warned about:
+        the install fails loudly on restricted admission anyway.
+        """
+        if self.platform != OPENSHIFT or not uses_openebs():
+            return
+        if storage_class_is_explicit():
+            self.logger.warning(
+                "Storage class %r selected by name on openshift: it applies the OpenEBS operator manifest "
+                "(two CRDs, cluster-scoped RBAC, two StorageClasses, a privileged node-disk-manager DaemonSet). "
+                "Nothing in this harness removes those objects; a restricted cluster refuses the privileged "
+                "pods after they exist.",
+                OPENebs,
+            )
+            return
+        raise PlatformVerificationError(
+            f"Refusing to run on openshift with the default storage class {OPENebs!r}: selecting it installs the "
+            "OpenEBS operator cluster-wide (CRDs, ClusterRoles, StorageClasses, a privileged node-disk-manager "
+            "DaemonSet) and nothing here removes those objects. Pass the cluster's own class: "
+            "--storage-class <name> (or set SREGYM_STORAGE_CLASS). See docs/openshift.md."
+        )
+
+    def _capture_run_baseline(self) -> None:
+        """Remember the cluster as it is before this run's first write, if nothing did.
+
+        The damage verdict compares the run against a baseline, and the only thing that
+        captured one until now was reconcile -- which is `off` by default on a managed
+        platform, so the verdict had nothing to compare and could only report that it could
+        not answer. This is a read-only snapshot held in memory: nothing is written, so a run
+        that does not ask for a verdict behaves exactly as before.
+        """
+        if not (is_openshift() or getattr(getattr(self, "config", None), "damage_verdict", False)):
+            return
+        # A partly built conductor, which several tests and the validator use, has no cluster
+        # state to snapshot; that is not a failure of this run.
+        state = getattr(self, "cluster_state", None)
+        if state is None or getattr(state, "baseline", None) is not None:
+            return
+        try:
+            state.capture_baseline()
+            self.logger.info("[DAMAGE] Captured a run baseline so the damage verdict can compare")
+        except Exception as exc:
+            self.logger.warning(f"[DAMAGE] Could not capture a run baseline: {exc}")
 
     def _verify_image_references(self, problem) -> None:
         """Refuse a run whose manifests name images the cluster may rewrite.
@@ -393,6 +457,137 @@ class Conductor:
             return
         self.logger.error(f"[DEPLOY] {message}")
         raise RuntimeError(message)
+
+    def teardown_observers(self) -> list[str]:
+        """Remove the observer stack and everything SREGym created outside its namespaces.
+
+        Called at the end of a campaign, never between problems: the oracles exec into
+        `observe/prometheus-server`, and a result may be re-evaluated after its problem ended.
+
+        Three things survive a namespaced cleanup and are removed here: the Helm releases, the
+        release PVCs Helm retains on purpose, and the cluster-scoped objects the charts and the
+        MCP manifest create. The last group is deleted by ownership label
+        (`sregym.service.owned_objects`), not by name, so a same-named object belonging to the
+        platform is never touched.
+
+        Returns the objects it removed, which is what the damage verdict is given as its only
+        tolerance: the verdict can excuse what this method reports and nothing else.
+        """
+        removed: list[str] = []
+        # `helm uninstall` removes the chart's ClusterRoles and Bindings without telling anyone,
+        # so they are recorded before it runs: every owned name that is gone afterwards was
+        # removed by this teardown, and the damage verdict must tolerate exactly that.
+        owned_before = {
+            kind: set(owned_names(self.kubectl, kind, log=self.logger)) for kind in OWNED_CLUSTER_SCOPED_KINDS
+        }
+        for component in (getattr(self, "prometheus", None), getattr(self, "loki", None)):
+            teardown = getattr(component, "teardown", None)
+            if teardown is None:
+                continue
+            try:
+                teardown()
+            except Exception as exc:
+                self.logger.warning(f"[TEARDOWN] {type(component).__name__} teardown failed: {exc}")
+        removed.extend(delete_owned_cluster_scoped(self.kubectl, log=self.logger))
+        for kind, names in owned_before.items():
+            still_there = set(owned_names(self.kubectl, kind, log=self.logger))
+            removed.extend(f"{kind}/{name}" for name in sorted(names - still_there))
+
+        for namespace in self._observer_namespaces():
+            self.logger.info(f"[TEARDOWN] Removing namespace {namespace}")
+            try:
+                self.kubectl.exec_command(f"kubectl delete namespace {self._q(namespace)} --ignore-not-found")
+            except Exception as exc:
+                self.logger.warning(f"[TEARDOWN] Could not delete namespace {namespace}: {exc}")
+                continue
+            removed.append(f"namespace/{namespace}")
+
+        for volume in self._report_surviving_volumes():
+            self.logger.warning(
+                f"[TEARDOWN] PersistentVolume {volume} is still present after teardown; "
+                "remove it by hand once its claim is gone"
+            )
+        return removed
+
+    def _observer_namespaces(self) -> list[str]:
+        """Return the namespaces the observer stack and the MCP server own, deduplicated."""
+        namespaces = []
+        for component in (getattr(self, "prometheus", None), getattr(self, "mcp_server", None)):
+            namespace = getattr(component, "namespace", None)
+            if namespace and namespace not in namespaces:
+                namespaces.append(namespace)
+        return namespaces
+
+    def _report_surviving_volumes(self) -> list[str]:
+        """Return the SREGym-owned volumes still present, without ever patching a finalizer."""
+        try:
+            listing = self.kubectl.exec_command_checked("kubectl get pv -o json", timeout=60)
+            items = json.loads(listing).get("items", [])
+        except Exception:
+            return []
+        survivors = []
+        for item in items:
+            claim_ref = item.get("spec", {}).get("claimRef") or {}
+            if claim_ref.get("namespace") in set(self._observer_namespaces()):
+                survivors.append(item["metadata"]["name"])
+        return sorted(survivors)
+
+    def cluster_damage_verdict(self, deleted_by_us=(), after_teardown: bool = False) -> "DamageReport":
+        """Compare the cluster with the baseline and return the verdict.
+
+        The baseline is the one this run captured before its first write. A run that cannot
+        compare -- no baseline, an unreadable API -- gets a warning and no verdict, never a
+        passing one.
+
+        `after_teardown` turns on the second direction of the check. Comparing snapshots can only
+        see what was removed or changed; an object this harness created and then failed to remove
+        is an addition, which is normally the run's own work and merely reported. Once a teardown
+        was asked for and has run, anything still carrying this harness's ownership is a leftover,
+        and it is named as damage rather than logged.
+        """
+        # A verdict is given once per run. A second one would compare the cluster with a
+        # baseline taken before a teardown that already ran, and read that teardown as damage.
+        self._damage_verdict_given = True
+        baseline = getattr(self.cluster_state, "baseline", None)
+        if baseline is None:
+            self.logger.warning("[DAMAGE] No baseline snapshot, so no verdict can be given")
+            return DamageReport(verdict=DAMAGED, changed=["no baseline snapshot was captured"])
+        try:
+            current = self.cluster_state.capture_baseline()
+        except Exception as exc:
+            self.logger.warning(f"[DAMAGE] Could not re-read the cluster, so no verdict can be given: {exc}")
+            return DamageReport(verdict=DAMAGED, changed=[f"the cluster could not be re-read: {exc}"])
+        survivors = self._objects_left_behind() if after_teardown else ()
+        report = compare(
+            baseline,
+            current,
+            deleted_by_us=deleted_by_us,
+            owned_namespaces=self._run_namespaces(),
+            survivors=survivors,
+        )
+        self.logger.log(logging.ERROR if not report.harmless else logging.INFO, report.text())
+        return report
+
+    def _objects_left_behind(self) -> list[str]:
+        """Return what this harness still owns on the cluster, by label, after a teardown.
+
+        Ownership is read from the objects themselves -- the label this harness sets and the
+        Helm release names it deploys -- never from a list of names it expects to have made, so
+        a same-named object belonging to someone else is not reported here. A read that fails is
+        a warning and an empty answer: the caller is a verdict, and inventing survivors from an
+        unreadable API would be as wrong as hiding them.
+        """
+        left: list[str] = []
+        for kind in OWNED_CLUSTER_SCOPED_KINDS:
+            left.extend(f"{kind}/{name}" for name in owned_names(self.kubectl, kind, log=self.logger))
+        for namespace in self._observer_namespaces():
+            try:
+                self.kubectl.exec_command_checked(f"kubectl get namespace {self._q(namespace)} -o name", timeout=30)
+            except Exception:
+                continue
+            left.append(f"namespace/{namespace}")
+        left.extend(f"persistentvolume/{name}" for name in self._report_surviving_volumes())
+        return sorted(set(left))
 
     def _verify_scc_grant(self) -> None:
         """Make the `anyuid` SCC prerequisite visible before the first destructive step.
@@ -430,7 +625,7 @@ class Conductor:
         whose app is not attached, answers for what it does know instead of failing
         inside a preflight.
         """
-        problem = self.current_problem
+        problem = getattr(self, "current_problem", None)
         app = getattr(problem, "app", None)
         components = (getattr(self, "prometheus", None), getattr(self, "mcp_server", None))
         namespaces = [
@@ -1597,7 +1792,13 @@ class Conductor:
             self.logger.warning(f"Could not fix Calico route-reflector label drift state: {e}")
 
     def fix_kubernetes(self):
+        """Prepare the cluster for a run, starting with a read-only snapshot of it.
+
+        The snapshot is what the damage verdict compares against, so it has to be taken before
+        anything this run creates -- observers included -- and before reconcile, which deletes.
+        """
         self.logger.info("Fixing Kubernetes... to normal state.")
+        self._capture_run_baseline()
 
         if is_openshift():
             self.logger.info(

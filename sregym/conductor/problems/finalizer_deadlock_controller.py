@@ -25,7 +25,11 @@ _CLUSTERROLEBINDING_NAME = "configmap-cleanup-controller"
 _CONFIGMAP_NAME = "reservation-cleanup-token"
 _FINALIZER = "cleanup.reservations.io/pending-cleanup"
 _CONTROLLER_IMAGE = "docker.io/python:3.12-alpine"
-_MANAGED_LABELS = {"app.kubernetes.io/managed-by": _CONTROLLER_NAME}
+# Two labels on purpose: `managed-by` is the scenario's own bookkeeping, and the
+# ownership label is what lets a teardown remove these objects when the run that
+# created them died before recovery. Without it the ClusterRole and
+# ClusterRoleBinding below survive every run that does not reach recover_fault.
+_MANAGED_LABELS = {"app.kubernetes.io/managed-by": _CONTROLLER_NAME, "sregym.io/owned": "true"}
 
 
 def _correct_clusterrole_rules():
@@ -137,6 +141,13 @@ class FinalizerDeadlockController(Problem):
         if not self._wait_until_configmap_deleted(timeout_seconds=60):
             raise TimeoutError(f"Controller did not delete ConfigMap `{self.configmap_name}` after RBAC recovery")
         print(f"ClusterRole `{self.clusterrole_name}` restored; controller completed cleanup")
+
+        # Recovery restores the fault; it does not remove the scenario's own objects.
+        # The ClusterRole and ClusterRoleBinding are cluster-scoped and would outlive
+        # the run, and a managed platform turns reconcile off, so nothing else would
+        # collect them. Removing them here is what makes the scenario leave no trace.
+        self._delete_support_resources()
+        print(f"Support resources removed; namespace {self.namespace} left as it was found")
 
         print(f"Resource: configmap/{self.configmap_name} | Namespace: {self.namespace}\n")
 

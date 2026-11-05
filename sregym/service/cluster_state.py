@@ -102,6 +102,9 @@ class ClusterBaseline:
     cluster_roles: set[str] = field(default_factory=set)
     cluster_role_bindings: set[str] = field(default_factory=set)
     persistent_volumes: set[str] = field(default_factory=set)
+    # PV name -> the namespace whose claim bound it. The damage verdict needs this to tell a
+    # volume the run created from one the platform had: names alone cannot say whose it was.
+    persistent_volume_namespaces: dict[str, str] = field(default_factory=dict)
     storage_classes: set[str] = field(default_factory=set)
     crds: set[str] = field(default_factory=set)
     validating_webhook_configs: set[str] = field(default_factory=set)
@@ -120,6 +123,7 @@ class ClusterBaseline:
             "cluster_roles": sorted(self.cluster_roles),
             "cluster_role_bindings": sorted(self.cluster_role_bindings),
             "persistent_volumes": sorted(self.persistent_volumes),
+            "persistent_volume_namespaces": dict(self.persistent_volume_namespaces),
             "storage_classes": sorted(self.storage_classes),
             "crds": sorted(self.crds),
             "validating_webhook_configs": sorted(self.validating_webhook_configs),
@@ -161,6 +165,7 @@ class ClusterBaseline:
             cluster_roles=set(data.get("cluster_roles", [])),
             cluster_role_bindings=set(data.get("cluster_role_bindings", [])),
             persistent_volumes=set(data.get("persistent_volumes", [])),
+            persistent_volume_namespaces=dict(data.get("persistent_volume_namespaces", {})),
             storage_classes=set(data.get("storage_classes", [])),
             crds=set(data.get("crds", [])),
             validating_webhook_configs=set(data.get("validating_webhook_configs", [])),
@@ -266,6 +271,7 @@ class ClusterStateManager:
             cluster_roles=self._get_cluster_roles(raise_on_error=True),
             cluster_role_bindings=self._get_cluster_role_bindings(raise_on_error=True),
             persistent_volumes=self._get_persistent_volumes(raise_on_error=True),
+            persistent_volume_namespaces=self._get_persistent_volume_namespaces(),
             storage_classes=self._get_storage_classes(raise_on_error=True),
             crds=self._get_crds(raise_on_error=True),
             validating_webhook_configs=self._get_validating_webhook_configs(raise_on_error=True),
@@ -748,6 +754,20 @@ class ClusterStateManager:
             if raise_on_error:
                 raise
             return set()
+
+    def _get_persistent_volume_namespaces(self) -> dict[str, str]:
+        """Return PV name -> claim namespace, so a removed volume can be attributed."""
+        try:
+            pvs = self.core_v1.list_persistent_volume()
+        except ApiException as e:
+            logger.error(f"Failed to read PV claim namespaces: {e}")
+            return {}
+        namespaces: dict[str, str] = {}
+        for pv in pvs.items:
+            claim_ref = pv.spec.claim_ref if pv.spec else None
+            if claim_ref is not None and claim_ref.namespace:
+                namespaces[pv.metadata.name] = claim_ref.namespace
+        return namespaces
 
     def _get_storage_classes(self, raise_on_error: bool = False) -> set[str]:
         """Get all StorageClass names."""

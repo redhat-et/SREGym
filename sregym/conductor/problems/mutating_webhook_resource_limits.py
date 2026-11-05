@@ -376,6 +376,8 @@ apiVersion: v1
 kind: Namespace
 metadata:
   name: {self.BACKEND_SVC_NAMESPACE}
+  labels:
+    sregym.io/owned: "true"
 ---
 apiVersion: v1
 kind: Secret
@@ -453,6 +455,7 @@ spec:
     targetPort: 8443
 """
 
+        self._refuse_foreign_platform_namespace()
         self._run(["kubectl", "apply", "-f", "-"], input=manifest)
         self._run(
             [
@@ -466,6 +469,29 @@ spec:
             ]
         )
 
+    def _refuse_foreign_platform_namespace(self) -> None:
+        """Refuse to adopt, and later delete, a `platform-ops` this harness did not create.
+
+        Recovery deletes this namespace by name. `apply` would silently adopt a pre-existing one,
+        and the run would then delete somebody else's namespace on the way out -- a removal no
+        verdict can undo. Ownership is read from the label the harness sets, so a namespace of
+        the same name that belongs to another owner stops the run instead of being taken over.
+        """
+        try:
+            existing = self.kubectl.core_v1_api.read_namespace(name=self.BACKEND_SVC_NAMESPACE)
+        except ApiException as e:
+            if e.status == 404:
+                return
+            raise
+        labels = (existing.metadata.labels or {}) if existing.metadata else {}
+        if labels.get("sregym.io/owned") == "true":
+            return
+        raise RuntimeError(
+            f"Namespace {self.BACKEND_SVC_NAMESPACE!r} already exists and was not created by SREGym "
+            f"(labels: {labels or '{}'}). This scenario deletes that namespace when it recovers, so it "
+            "will not adopt one it does not own. Remove it, or run this scenario elsewhere."
+        )
+
     def _build_webhook_body(self) -> dict:
         if not self.ca_bundle:
             raise RuntimeError("ca_bundle not initialized; call _ensure_webhook_backend first")
@@ -473,7 +499,7 @@ spec:
         return {
             "apiVersion": "admissionregistration.k8s.io/v1",
             "kind": "MutatingWebhookConfiguration",
-            "metadata": {"name": self.WEBHOOK_NAME},
+            "metadata": {"name": self.WEBHOOK_NAME, "labels": {"sregym.io/owned": "true"}},
             "webhooks": [
                 {
                     "name": self.WEBHOOK_FQDN,
@@ -679,8 +705,18 @@ spec:
             print(f"Created MutatingWebhookConfiguration: {self.WEBHOOK_NAME}")
         except ApiException as e:
             if e.status == 409:
-                print(f"MutatingWebhookConfiguration {self.WEBHOOK_NAME} exists; replacing")
+                # Replacing an existing object of this name is only safe when it is this
+                # harness's own leftover. The name is Gatekeeper's canonical one, so a real
+                # Gatekeeper install would land here, and recovery deletes this object.
                 existing = self.admission_api.read_mutating_webhook_configuration(name=self.WEBHOOK_NAME)
+                existing_labels = ((existing.metadata.labels or {}) if existing.metadata else {}) or {}
+                if existing_labels.get("sregym.io/owned") != "true":
+                    raise RuntimeError(
+                        f"MutatingWebhookConfiguration {self.WEBHOOK_NAME!r} already exists and was not created "
+                        f"by SREGym (labels: {existing_labels or '{}'}). This scenario deletes that object when it "
+                        "recovers, so it will not replace one it does not own."
+                    ) from e
+                print(f"MutatingWebhookConfiguration {self.WEBHOOK_NAME} is this harness's own leftover; replacing")
                 webhook["metadata"]["resourceVersion"] = existing.metadata.resource_version
                 self.admission_api.replace_mutating_webhook_configuration(name=self.WEBHOOK_NAME, body=webhook)
             else:

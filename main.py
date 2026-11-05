@@ -110,6 +110,61 @@ def _http_endpoint(value: str) -> str:
     return value
 
 
+def finish_campaign(conductor, base_dir: Path, *, teardown_observers: bool, results: list[dict]) -> None:
+    """Close a campaign: remove the observer stack when asked, then judge the cluster.
+
+    Both halves live together because the order matters. The verdict is given the list of
+    objects the teardown removed, which is its only tolerance: run the verdict first and a
+    teardown it performed itself would read as damage.
+
+    The verdict runs when the operator asked for teardown or the platform is OpenShift, so a
+    plain local run behaves exactly as it did before. A verdict that is not harmless raises, so
+    a run that changed a pre-existing object is reported as such instead of finishing quietly.
+    """
+    removed_by_us: tuple = ()
+    if teardown_observers:
+        console.log("\U0001f9f9 Removing the observer stack...")
+        removed_by_us = tuple(conductor.teardown_observers())
+
+    if teardown_observers or is_openshift():
+        # The survivor check only applies when a teardown was asked for: without one, the
+        # observer stack staying up is the requested state, not a leftover.
+        damage = conductor.cluster_damage_verdict(deleted_by_us=removed_by_us, after_teardown=teardown_observers)
+        damage.write(base_dir / "damage.json")
+        console.log(damage.text())
+        if not damage.harmless:
+            raise BenchmarkCampaignAborted(damage.text(), results)
+
+
+def judge_cluster_after_abort(conductor, *, teardown_observers: bool, abort_reason: str) -> None:
+    """Give the cluster a verdict when a campaign ends without reaching finish_campaign.
+
+    An abort is exactly when the cluster state is least known: a scenario may have failed
+    halfway, or the harness may have died with objects it created still on the cluster. Leaving
+    those runs unjudged means the leftover is discovered later, by someone else, with nothing
+    that says whether it was there before. So the same comparison runs here, with one difference:
+    nothing is torn down. Deleting objects while the state is uncertain is how a reported leftover
+    becomes an unreported removal.
+
+    Only runs that would have been judged anyway are judged here -- teardown requested, or an
+    OpenShift platform -- so a plain local run keeps its behaviour. A run that never captured a
+    baseline has nothing to compare, and inventing one now would compare the cluster against its
+    already-damaged self, so it gets no verdict.
+    """
+    if not (teardown_observers or is_openshift()):
+        return
+    if getattr(conductor, "_damage_verdict_given", False):
+        return
+    if getattr(conductor.cluster_state, "baseline", None) is None:
+        logger.info("[DAMAGE] No baseline was captured before the abort, so no verdict can be given")
+        return
+    base_dir = _driver_base_dir if _driver_base_dir is not None else Path("results")
+    damage = conductor.cluster_damage_verdict()
+    damage.write(base_dir / "damage.json")
+    console.log(damage.text())
+    logger.error("Cluster verdict after abort (%s): %s", abort_reason, damage.verdict.upper())
+
+
 def campaign_abort_for_platform_refusal(error: BaseException, rows: list[dict]) -> "BenchmarkCampaignAborted":
     """Return the abort that ends a campaign whose platform was refused.
 
@@ -296,6 +351,7 @@ def driver_loop(
     judge_backend: str = "api",
     internet_access: str = "filtered",
     stop_event: threading.Event | None = None,
+    teardown_observers: bool = False,
 ):
     """
     Deploy each problem and wait for HTTP grading via POST /submit.
@@ -923,6 +979,15 @@ def driver_loop(
             console.log("🔓 Stopping Kubernetes API proxy...")
             conductor.stop_k8s_proxy()
 
+        # An external harness owns the cluster from here: it evaluates against a live fault, so
+        # removing the observers would pull the metrics the fault is judged by.
+        finish_campaign(
+            conductor,
+            Path(base_dir),
+            teardown_observers=teardown_observers,
+            results=[{agent_to_run: all_results_for_agent}],
+        )
+
         return [{agent_to_run: all_results_for_agent}]
 
     try:
@@ -943,6 +1008,7 @@ def _run_driver_and_shutdown(
     judge_backend: str = "api",
     internet_access: str = "filtered",
     stop_event: threading.Event | None = None,
+    teardown_observers: bool = False,
 ):
     """Run the benchmark driver, stash results, then tell the API to exit."""
     global _driver_error, _driver_results
@@ -958,15 +1024,26 @@ def _run_driver_and_shutdown(
             judge_backend=judge_backend,
             internet_access=internet_access,
             stop_event=stop_event,
+            teardown_observers=teardown_observers,
         )
         _driver_results = results
     except BenchmarkCampaignAborted as exc:
         _driver_results = exc.partial_results
         _driver_error = exc
         logger.error("Benchmark campaign aborted: %s", exc)
+        # The one thing an abort must not lose is whether the cluster was left intact.
+        try:
+            judge_cluster_after_abort(conductor, teardown_observers=teardown_observers, abort_reason=str(exc))
+        except Exception:
+            logger.exception("Could not judge the cluster after the abort")
     except BaseException as exc:
         _driver_error = exc
         logger.exception("Driver thread crashed")
+        # A crashed driver is the run whose cluster state nobody knows, so it is judged last.
+        try:
+            judge_cluster_after_abort(conductor, teardown_observers=teardown_observers, abort_reason=repr(exc))
+        except Exception:
+            logger.exception("Could not judge the cluster after the driver crashed")
     finally:
         with _launcher_cleanup_lock:
             LAUNCHER.cleanup_all()
@@ -974,6 +1051,10 @@ def _run_driver_and_shutdown(
             # This thread owns deployment, so its setup work has stopped before
             # recovery starts. The main thread must not tear down concurrently.
             cleanup_interrupted_problem(conductor)
+            try:
+                judge_cluster_after_abort(conductor, teardown_observers=teardown_observers, abort_reason="interrupted")
+            except Exception:
+                logger.exception("Could not judge the cluster after the interrupt")
         request_shutdown()
 
 
@@ -1033,11 +1114,34 @@ def platform_support_skips(suite: str | None) -> list[str]:
             print(f"[openshift] {entry['verdict']}: {problem}: {entry['reason']}")
     excluded = [problem for problem, entry in support.items() if entry["verdict"] == "exclude"]
     if excluded:
+        # The runbook calls the log "the whole run", so the skip has to be in it, not only
+        # on the terminal of whoever started the process.
+        logger.warning(
+            "Skipping %s in %s: it cannot be expressed on this platform (%s). The rest of the suite runs.",
+            ", ".join(excluded),
+            suite,
+            PLATFORM_SUPPORT[excluded[0]]["reason"],
+        )
         print(
             f"[openshift] Skipping {', '.join(excluded)} in {suite}: it cannot be expressed on this platform "
             f"({PLATFORM_SUPPORT[excluded[0]]['reason']}). The rest of the suite runs. See docs/openshift.md."
         )
     return excluded
+
+
+def apply_platform_skips(suite: str | None, selection, skips) -> list[str]:
+    """Drop the scenarios this platform cannot express, and refuse an emptied selection.
+
+    An empty selection is not a suite run that passed: it is a run in which nothing happened,
+    and it would exit zero and look like a result. The refusal names the suite and what left it.
+    """
+    kept = [pid for pid in selection if pid not in skips]
+    if not kept and selection:
+        raise ValueError(
+            f"Refusing --suite {suite}: every scenario in it is excluded on this platform "
+            f"({', '.join(sorted(skips))}). Nothing would run. See docs/openshift.md."
+        )
+    return kept
 
 
 def main(args):
@@ -1147,6 +1251,7 @@ def _run_benchmark(args, *, judge_backend: str = "api", agent_image: str | None 
         propagation_override_s=getattr(args, "propagation", None),
         reconcile=getattr(args, "reconcile", None),
         allow_unqualified_images=bool(getattr(args, "allow_unqualified_images", False)),
+        damage_verdict=bool(getattr(args, "teardown_observers", False)),
     )
     LAUNCHER.set_internet_policy(conductor_config.internet_policy)
     LAUNCHER.set_container_hardening(harden_container)
@@ -1182,7 +1287,10 @@ def _run_benchmark(args, *, judge_backend: str = "api", agent_image: str | None 
     suite = getattr(args, "suite", None)
     problem_selection = (args.problem,) if args.problem else PROBLEM_SETS.get(suite)
     if problem_selection is not None:
-        problem_selection = [pid for pid in problem_selection if pid not in _suite_skips]
+        try:
+            problem_selection = apply_platform_skips(suite, problem_selection, _suite_skips)
+        except ValueError as exc:
+            sys.exit(str(exc))
     if suite:
         logger.info(f"Running {suite}: {len(problem_selection)} problems")
 
@@ -1204,6 +1312,7 @@ def _run_benchmark(args, *, judge_backend: str = "api", agent_image: str | None 
             "judge_backend": judge_backend,
             "internet_access": internet_policy.mode.value,
             "stop_event": stop_event,
+            "teardown_observers": bool(getattr(args, "teardown_observers", False)),
         },
         daemon=True,
     )
@@ -1407,6 +1516,16 @@ if __name__ == "__main__":
             "Proceed when the image preflight finds manifests whose image names carry no registry "
             "host. The preflight cannot know a cluster's short-name alias table, so it refuses by "
             "default; this asserts that this cluster resolves those names. Every finding is logged."
+        ),
+    )
+    parser.add_argument(
+        "--teardown-observers",
+        action="store_true",
+        help=(
+            "Remove the observer stack at the end of the campaign: the Helm releases, their "
+            "retained volumes, and the cluster-scoped objects this harness created. Off by "
+            "default, because an iterate-fast loop reuses the stack. Reuse is safe only while "
+            "the chart version and the values are unchanged."
         ),
     )
     parser.add_argument(

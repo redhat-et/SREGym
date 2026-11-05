@@ -1,10 +1,15 @@
-"""A platform refusal ends the attempt; it never starts teardown.
+"""A platform refusal ends the campaign; it never starts teardown.
 
 `verify_platform` refuses when the declared platform is not confirmed by the
 cluster. That is a decision about the cluster, not a transient deploy failure, so
 main.py's retry loop must neither retry it nor run `finish_problem_with_deadline`,
 whose recovery and application cleanup would write to the very cluster the check
 just declared off-limits.
+
+It also ends the campaign. One refusal reported per problem and per attempt reads
+like a broken benchmark rather than a wrong cluster, so the loop keeps the single
+row it wrote and raises `BenchmarkCampaignAborted`, which the existing handler
+reports and turns into a non-zero exit.
 """
 
 import importlib.util
@@ -12,6 +17,8 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
+
+import pytest
 
 REFUSAL = "This cluster is OpenShift, but the platform resolved to 'kind'."
 
@@ -54,13 +61,15 @@ def test_a_platform_refusal_is_attempted_once_and_records_the_failure(monkeypatc
     monkeypatch.setattr(benchmark_main, "get_profile", lambda: "full")
     conductor = _conductor(benchmark_main, _refusal(benchmark_main))
 
-    # The loop handles the refusal and returns normally; it does not propagate.
-    results = benchmark_main.driver_loop(conductor, use_external_harness=True)
+    # The loop stops the campaign instead of walking on to the next attempt.
+    with pytest.raises(benchmark_main.BenchmarkCampaignAborted) as raised:
+        benchmark_main.driver_loop(conductor, use_external_harness=True)
 
     conductor.start_problem.assert_awaited_once()
-    assert results == [
+    assert raised.value.partial_results == [
         {None: [{"problem_id": "problem", "attempt": 1, "deployment_profile": "full", "deploy_failed": True}]}
     ]
+    assert "does not confirm the declared platform" in str(raised.value)
 
 
 def test_a_platform_refusal_runs_no_recovery_or_teardown(monkeypatch, tmp_path):
@@ -70,7 +79,8 @@ def test_a_platform_refusal_runs_no_recovery_or_teardown(monkeypatch, tmp_path):
     monkeypatch.setattr(benchmark_main, "get_profile", lambda: "full")
     conductor = _conductor(benchmark_main, _refusal(benchmark_main))
 
-    benchmark_main.driver_loop(conductor, use_external_harness=True)
+    with pytest.raises(benchmark_main.BenchmarkCampaignAborted):
+        benchmark_main.driver_loop(conductor, use_external_harness=True)
 
     conductor.finish_problem_in_background.assert_not_called()
     conductor.wait_for_submission_work.assert_not_awaited()

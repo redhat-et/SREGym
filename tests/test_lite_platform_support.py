@@ -141,3 +141,34 @@ def test_the_suite_selection_drops_what_the_table_excludes(on_openshift, monkeyp
     capsys.readouterr()
     assert len([pid for pid in real if pid not in real_skipped]) == len(real) - 1
     assert EXCLUDED["sregym-lite"] in real_skipped
+
+
+def test_the_skip_reason_reaches_the_log_and_not_only_the_terminal(on_openshift, caplog):
+    """operations.md calls the log file 'the whole run', so the skip belongs in it."""
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        on_openshift.platform_support_skips("sregym-lite")
+
+    assert "Skipping" in caplog.text
+    assert EXCLUDED["sregym-lite"] in caplog.text
+
+
+def test_a_suite_whose_every_scenario_is_excluded_is_refused(on_openshift):
+    """Zero problems must not exit 0 and look like a successful suite run."""
+    selection = (EXCLUDED["sregym-lite"],)
+    skips = on_openshift.platform_support_skips("sregym-lite")
+
+    with pytest.raises(ValueError, match="every scenario in it is excluded"):
+        on_openshift.apply_platform_skips("sregym-lite", selection, skips)
+
+
+def test_a_selection_that_keeps_something_is_returned_without_the_skips(on_openshift):
+    selection = list(on_openshift.PROBLEM_SETS["sregym-lite"])
+    skips = on_openshift.platform_support_skips("sregym-lite")
+
+    kept = on_openshift.apply_platform_skips("sregym-lite", selection, skips)
+
+    assert len(kept) == len(selection) - 1
+    assert EXCLUDED["sregym-lite"] not in kept
+    assert kept == [pid for pid in selection if pid != EXCLUDED["sregym-lite"]]

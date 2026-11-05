@@ -103,6 +103,9 @@ def test_register_agent_records_whether_a_container_is_launched():
 )
 def test_start_problem_checks_the_binaries_the_platform_needs(monkeypatch, conductor, platform, agent_name, expected):
     monkeypatch.setenv("SREGYM_PLATFORM", platform)
+    # An OpenShift run must name a storage class: the default one is OpenEBS, and selecting it
+    # installs cluster-scoped objects nothing removes, so the run is refused before this point.
+    monkeypatch.setenv("SREGYM_STORAGE_CLASS", "gp3-csi")
     if agent_name is not None:
         conductor.register_agent(agent_name)
     conductor.kubectl.openshift_api_present.return_value = platform == OPENSHIFT

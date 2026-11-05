@@ -60,6 +60,17 @@ def uses_openebs() -> bool:
     return get_storage_class() == OPENebs
 
 
+def storage_class_is_explicit() -> bool:
+    """Return True when someone named a class, rather than falling through to the default.
+
+    The distinction matters on a managed platform: the default names OpenEBS, and
+    selecting OpenEBS installs a provisioner, cluster-scoped RBAC and a privileged
+    DaemonSet that nothing in this harness removes. A class nobody named is a
+    forgotten flag, not a request for that install.
+    """
+    return _storage_class is not None or bool(os.environ.get(_ENV_VAR))
+
+
 def validate_storage_class_name(name: str) -> str:
     """Return ``name`` if it can name a storage class, else raise ValueError.
 
