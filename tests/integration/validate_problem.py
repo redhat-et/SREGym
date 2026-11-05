@@ -152,6 +152,9 @@ def validate(
         except RuntimeError as exc:
             raise ValidationError(str(exc)) from exc
         # The validator launches no agent container, so docker is only required when the platform is kind.
+        # The admission preflight runs inside start_problem, which this script never reaches.
+        # On OpenShift it reads a SubjectAccessReview and never grants anything.
+        conductor._verify_scc_grant()
         conductor.dependency_check(conductor.required_binaries())
         conductor.fix_kubernetes()
         conductor.undeploy_app()  # clear any leftovers from a previous run

@@ -43,7 +43,7 @@ from sregym.conductor.conductor import (
     reconcile_refusal,
 )
 from sregym.conductor.conductor_api import request_shutdown, run_api
-from sregym.conductor.problem_sets import PROBLEM_SETS
+from sregym.conductor.problem_sets import PLATFORM_SUPPORT, PLATFORM_VERDICTS, PROBLEM_SETS
 from sregym.phases import read_ledger as read_phase_ledger
 from sregym.phases import results_columns as phase_results_columns
 from sregym.profile import PROFILES, get_profile, set_profile
@@ -975,6 +975,40 @@ def internet_access_refusal(policy: InternetPolicy, agent_name: str | None = Non
     )
 
 
+def platform_support_skips(suite: str | None) -> list[str]:
+    """Print the OpenShift support summary for a named suite and name what it cannot run.
+
+    Returns the problems to skip, empty when the suite runs whole. Prints nothing
+    at all off ``openshift``: the table is an OpenShift statement, and ``kind``
+    output is compared against recorded transcripts.
+
+    An excluded scenario is skipped, not refused: one scenario the platform cannot
+    express does not invalidate the sixteen it can, and refusing the whole suite
+    bought nothing that a named skip does not. Every Lite set is checked, so the
+    skip cannot be bypassed by naming the other set.
+    """
+    if suite is None or not is_openshift():
+        return []
+    problems = PROBLEM_SETS.get(suite)
+    if problems is None:
+        return []
+    support = {problem: PLATFORM_SUPPORT[problem] for problem in problems}
+    counts = dict.fromkeys(PLATFORM_VERDICTS, 0)
+    for entry in support.values():
+        counts[entry["verdict"]] += 1
+    print(f"[openshift] {suite}: " + ", ".join(f"{counts[verdict]} {verdict}" for verdict in PLATFORM_VERDICTS))
+    for problem, entry in support.items():
+        if entry["verdict"] != "works":
+            print(f"[openshift] {entry['verdict']}: {problem}: {entry['reason']}")
+    excluded = [problem for problem, entry in support.items() if entry["verdict"] == "exclude"]
+    if excluded:
+        print(
+            f"[openshift] Skipping {', '.join(excluded)} in {suite}: it cannot be expressed on this platform "
+            f"({PLATFORM_SUPPORT[excluded[0]]['reason']}). The rest of the suite runs. See docs/openshift.md."
+        )
+    return excluded
+
+
 def main(args):
     configure_jev(args)
     init_logger()
@@ -991,6 +1025,11 @@ def _run_benchmark(args, *, judge_backend: str = "api", agent_image: str | None 
     agent_model, judge_model = _configure_model_environment(args)
     # The platform has to be known before anything derives behaviour from it.
     set_platform(args.platform)
+    # A Lite suite states its OpenShift support, and refuses an excluded scenario by
+    # name before any cluster work, instead of failing inside the deploy stage.
+    # An excluded scenario is skipped with its reason, not a refusal: the suite runs
+    # without it. Printed once here; the selection filter below consumes the same list.
+    _suite_skips = platform_support_skips(getattr(args, "suite", None))
     # The storage class is caller input, so it is checked before any chart names it.
     # tests build args without the flag, hence getattr.
     storage_class = getattr(args, "storage_class", None)
@@ -1110,6 +1149,8 @@ def _run_benchmark(args, *, judge_backend: str = "api", agent_image: str | None 
 
     suite = getattr(args, "suite", None)
     problem_selection = (args.problem,) if args.problem else PROBLEM_SETS.get(suite)
+    if problem_selection is not None:
+        problem_selection = [pid for pid in problem_selection if pid not in _suite_skips]
     if suite:
         logger.info(f"Running {suite}: {len(problem_selection)} problems")
 

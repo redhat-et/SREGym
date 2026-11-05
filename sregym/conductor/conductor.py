@@ -44,7 +44,9 @@ from sregym.observer.otel_collector import OtelCollector
 from sregym.paths import CLUSTER_BASELINE_STATE_FILE
 from sregym.phases import PhaseLedger
 from sregym.profile import is_svelte
+from sregym.service.admission_preflight import MISSING, check_scc_grant, grant_commands
 from sregym.service.apps.app_registry import AppRegistry
+from sregym.service.capacity_preflight import check_capacity
 from sregym.service.cluster_egress import ClusterEgressBoundary
 from sregym.service.cluster_state import (
     RECONCILE_MODES,
@@ -159,6 +161,9 @@ class Conductor:
         # no longer exists: reconcile then has nothing trustworthy to aim at.
         self._baseline_usable = True
         self._platform_verified = False
+        # False until the first problem of a campaign has cleared the capacity
+        # preflight; every later problem of that campaign reuses the verdict.
+        self._capacity_verified = False
 
         # Kubernetes API proxy to hide chaos engineering namespaces and load generators from agents
         self.k8s_proxy = KubernetesAPIProxy(
@@ -349,6 +354,53 @@ class Conductor:
         # cluster_platform module predicates, never by reading this attribute.
         self.platform = verify_platform_matches_cluster(self.kubectl.openshift_api_present, log=self.logger)
         self._platform_verified = True
+
+    def _verify_scc_grant(self) -> None:
+        """Make the `anyuid` SCC prerequisite visible before the first destructive step.
+
+        The application images need `anyuid` on OpenShift: several apps pin a non-root
+        UID that `restricted-v2` refuses, and mongo and memcached run as root. The
+        harness never grants it, and app namespaces are created per problem, so this
+        asks the API server about each namespace's service-account group up front and
+        refuses on a confirmed gap. A review the identity may not read is a warning
+        and the run continues; see `sregym.service.admission_preflight`.
+
+        Skipped on `kind`, which has no SCCs: no read and no log line there.
+        """
+        if not is_openshift():
+            return
+        result = check_scc_grant(self.kubectl, self._run_namespaces())
+        if result.state == MISSING:
+            raise RuntimeError(
+                f"The anyuid SCC is not granted to the service accounts in {', '.join(result.missing)}, so the "
+                "application pods that pin a non-root UID, and mongo and memcached, which run as root, are refused "
+                "by restricted-v2 admission. The harness never grants an SCC; an operator grants it once per "
+                "namespace:\n" + "\n".join(grant_commands(result.missing))
+            )
+        # `cannot_verify` is already reported by the preflight, with the same commands,
+        # and the run continues: SCC objects and their bindings are cluster-scoped, so a
+        # project-scoped identity cannot read them.
+
+    def _run_namespaces(self) -> list[str]:
+        """Every namespace this run deploys into, deduplicated, in deployment order.
+
+        Read from the objects that will deploy there rather than from literals: the
+        telemetry stack owns `observe` and the MCP server owns `sregym`, and a composite
+        application spans several namespaces, which `deploy_app` reads the same way.
+        Each attribute is read with `getattr` so a partly built conductor, or a problem
+        whose app is not attached, answers for what it does know instead of failing
+        inside a preflight.
+        """
+        problem = self.current_problem
+        app = getattr(problem, "app", None)
+        components = (getattr(self, "prometheus", None), getattr(self, "mcp_server", None))
+        namespaces = [
+            *(getattr(component, "namespace", None) for component in components),
+            getattr(problem, "namespace", None),
+            *(getattr(app, "namespaces", None) or ()),
+            getattr(app, "namespace", None),
+        ]
+        return list(dict.fromkeys(namespace for namespace in namespaces if namespace))
 
     def required_binaries(self) -> list[str]:
         """Return the host binaries this run needs on PATH.
@@ -888,6 +940,9 @@ class Conductor:
         self.detection_oracle = DetectionOracle(self.problem)
 
         self.verify_platform()
+        # Read-only, and before the first destructive step: the anyuid SCC grant is what
+        # the application images need on OpenShift, and the harness never grants it.
+        self._verify_scc_grant()
 
         required_binaries = self.required_binaries()
         self.dependency_check(required_binaries)
@@ -1690,6 +1745,10 @@ class Conductor:
             )
             self.verify_storage_class()
 
+        # Before the ~15 observer pods exist, not after them: a cluster or project that
+        # cannot hold one run fails the deploy pod by pod, one readiness timeout each.
+        self._verify_capacity()
+
         self.logger.info("[DEPLOY] Deploying Prometheus…")
         self.prometheus.deploy()
 
@@ -1743,6 +1802,37 @@ class Conductor:
         """Teardown problem.app and, if no other apps running, OpenEBS/Prometheus."""
         if self.problem:
             self.problem.app.cleanup()
+
+    def _verify_capacity(self) -> None:
+        """Refuse before the pods are created when this run does not fit the cluster.
+
+        Skipped on `kind`, whose cluster is a workstation sized for this run: no read
+        and no log line there. On OpenShift the run's pod, CPU, memory and storage
+        footprint is compared with what the untainted workers can allocate and with a
+        `ResourceQuota` in any namespace the run uses; see
+        `sregym.service.capacity_preflight`.
+
+        Once per campaign, not once per problem: every problem of a campaign deploys
+        onto the same cluster, so the scan runs on the first one and the verdict is
+        kept on this instance. A new campaign needs a new conductor, which is what
+        main.py and the validator already build. The footprint is the same for every
+        problem of a campaign -- the deployment profile and `deploy_loki` are fixed for
+        the process -- which is what makes the remembered verdict valid.
+
+        The verdict is only remembered once the scan passed: a refusal raises, so the
+        campaign ends rather than carrying a failed check into the next problem.
+        """
+        if not is_openshift():
+            return
+        # A conductor built without __init__ -- several tests and the validator do --
+        # has no verdict yet and no config; a missing config deploys Loki, which is
+        # `ConductorConfig`'s own default, so the estimate errs high, never low.
+        if getattr(self, "_capacity_verified", False):
+            return
+        config = getattr(self, "config", None)
+        deploy_loki = getattr(config, "deploy_loki", True)
+        check_capacity(self.kubectl, self._run_namespaces(), deploy_loki=deploy_loki, log=self.logger)
+        self._capacity_verified = True
 
     def _ensure_metrics_api(self) -> None:
         """Require a working metrics.k8s.io without replacing one the platform serves."""

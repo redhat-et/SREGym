@@ -17,7 +17,7 @@ def runner():
 
 def test_non_kind_context_is_rejected(monkeypatch, runner):
     monkeypatch.setattr(runner.subprocess, "check_output", Mock(return_value="production\n"))
-    with pytest.raises(RuntimeError, match="disposable local KIND"):
+    with pytest.raises(RuntimeError, match="deletes namespaces"):
         runner.cluster_identity()
 
 
@@ -39,8 +39,12 @@ def _setup(monkeypatch, runner, tmp_path, *, resume=False):
     if resume:
         argv.append("--resume")
     monkeypatch.setattr(runner.sys, "argv", argv)
-    identity = {"context": "kind-test", "nodes": [{"name": "node", "uid": "uid-1", "architecture": "arm64"}]}
-    monkeypatch.setattr(runner, "cluster_identity", lambda: identity)
+    identity = {
+        "context": "kind-test",
+        "platform": runner.KIND,
+        "identity": [{"name": "node", "uid": "uid-1", "architecture": "arm64"}],
+    }
+    monkeypatch.setattr(runner, "cluster_identity", lambda *args, **kwargs: identity)
     return problems, identity
 
 
@@ -49,6 +53,9 @@ def test_success_writes_each_result_and_unbuffered_child_logs(monkeypatch, runne
 
     def launch(command, **kwargs):
         assert command[1] == "-u"
+        # The child validator takes the platform the identity resolved, so a confirmed
+        # managed cluster never runs the kind code path.
+        assert command[command.index("--platform") + 1] == "kind"
         result_path = Path(command[command.index("--json-summary") + 1])
         result_path.write_text(json.dumps({"passed": True}))
         return Mock(returncode=0)
@@ -106,7 +113,7 @@ def test_resume_skips_passed_problems(monkeypatch, runner, tmp_path):
 
 def test_resume_rejects_recreated_cluster(monkeypatch, runner, tmp_path):
     _, identity = _setup(monkeypatch, runner, tmp_path, resume=True)
-    old_identity = {**identity, "nodes": [{**identity["nodes"][0], "uid": "old-uid"}]}
+    old_identity = {**identity, "identity": [{**identity["identity"][0], "uid": "old-uid"}]}
     (tmp_path / "suite.json").write_text(
         json.dumps({"cluster": old_identity, "profile": "full", "with_loki": True, "attempts": []})
     )

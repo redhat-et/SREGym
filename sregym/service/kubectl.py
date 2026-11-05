@@ -63,6 +63,7 @@ class KubeCtl:
         self.core_v1_api = client.CoreV1Api()
         self.apps_v1_api = client.AppsV1Api()
         self.apis_api = client.ApisApi()
+        self.authorization_v1_api = client.AuthorizationV1Api()
 
     def list_namespaces(self):
         """Return a list of all namespaces in the cluster."""
