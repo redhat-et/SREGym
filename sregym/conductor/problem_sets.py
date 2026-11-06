@@ -67,44 +67,68 @@ PLATFORM_VERDICTS = ("works", "fixable", "exclude")
 # docs/openshift.md; a row names them only where nothing more specific blocks it.
 PLATFORM_SUPPORT = {
     "cronjob_sidecar_blocks_completion_hotel_reservation": {
-        "verdict": "fixable",
-        "reason": "the injected sidecar image is qualified now and everything else is namespaced; only a cluster run can move this verdict",
-        "requires": "qualified image references (plan item 8)",
+        "verdict": "works",
+        "reason": (
+            "passed the oracle lifecycle on ROSA 4.22.18 with a clean or owned damage verdict (logs/rosa-oracle-all): "
+            "the injected sidecar and every other change is namespaced"
+        ),
+        "requires": "anyuid grant for the app namespace; qualified image references (scripts/qualify_submodule_images.py)",
     },
     "edge_request_filter_cpu_saturation": {
-        "verdict": "fixable",
-        "reason": "the chart pins `runAsUser: 101`, which restricted-v2 rejects; the fault is `kubectl exec` only",
+        "verdict": "works",
+        "reason": (
+            "passed the oracle lifecycle on ROSA 4.22.18 with a clean or owned damage verdict (logs/rosa-oracle-all): "
+            "`kubectl exec` only; the chart's `runAsUser: 101` is admitted under `anyuid`"
+        ),
         "requires": "anyuid grant for the app namespace",
     },
     "network_policy_block": {
-        "verdict": "fixable",
-        "reason": "a namespaced NetworkPolicy only; proven on ROSA with the branch edits",
-        "requires": "anyuid grant for the app namespace",
+        "verdict": "works",
+        "reason": (
+            "passed the oracle lifecycle on ROSA 4.22.18 with a clean or owned damage verdict (logs/rosa-oracle-all): "
+            "a namespaced NetworkPolicy only"
+        ),
+        "requires": "anyuid grant for the app namespace; qualified image references (scripts/qualify_submodule_images.py)",
     },
     "env_variable_shadowing_astronomy_shop": {
-        "verdict": "fixable",
-        "reason": "the chart pins `runAsUser: 1001`, which restricted-v2 rejects; the fault is namespaced env edits",
+        "verdict": "works",
+        "reason": (
+            "passed the oracle lifecycle on ROSA 4.22.18 with a clean or owned damage verdict (logs/rosa-oracle-all): "
+            "namespaced env edits; the chart's `runAsUser: 1001` is admitted under `anyuid`"
+        ),
         "requires": "anyuid grant for the app namespace",
     },
     "mutating_webhook_resource_limits_social_network": {
-        "verdict": "fixable",
-        "reason": "five cluster-scoped `MutatingWebhookConfiguration` objects and namespace `platform-ops`",
-        "requires": "cluster-admin",
+        "verdict": "works",
+        "reason": (
+            "passed the oracle lifecycle on ROSA 4.22.18 with a clean or owned damage verdict (logs/rosa-oracle-all): "
+            "five cluster-scoped `MutatingWebhookConfiguration` objects and namespace `platform-ops`, all removed at teardown"
+        ),
+        "requires": "cluster-admin; anyuid grant for the app namespace",
     },
     "finalizer_deadlock_controller_hotel_reservation": {
-        "verdict": "fixable",
-        "reason": "the fault writes a `ClusterRole` and a `ClusterRoleBinding`",
-        "requires": "cluster-admin",
+        "verdict": "works",
+        "reason": (
+            "passed the oracle lifecycle on ROSA 4.22.18 with a clean or owned damage verdict (logs/rosa-oracle-all): "
+            "writes a `ClusterRole` and a `ClusterRoleBinding`; recovery keeps the controller the oracle needs and the teardown collects the owned RBAC"
+        ),
+        "requires": "cluster-admin; anyuid grant for the app namespace; qualified image references (scripts/qualify_submodule_images.py)",
     },
     "kafka_poison_pill_hol_block": {
-        "verdict": "fixable",
-        "reason": "`kubectl exec` into the in-namespace broker; the images are already qualified",
-        "requires": None,
+        "verdict": "works",
+        "reason": (
+            "passed the oracle lifecycle on ROSA 4.22.18 with a clean or owned damage verdict (logs/rosa-oracle-all): "
+            "`kubectl exec` into the in-namespace broker"
+        ),
+        "requires": "anyuid grant for the app namespace",
     },
     "internal_traffic_policy_local_astronomy_shop": {
-        "verdict": "fixable",
-        "reason": "the fault pins a pod away from its caller, so it needs two or more schedulable workers",
-        "requires": "two or more schedulable workers",
+        "verdict": "works",
+        "reason": (
+            "passed the oracle lifecycle on ROSA 4.22.18 with a clean or owned damage verdict (logs/rosa-oracle-all): "
+            "pins a pod away from its caller; the node picker skips tainted and cordoned nodes (ROSA's infra workers)"
+        ),
+        "requires": "two or more untainted schedulable workers; anyuid grant for the app namespace",
     },
     "service_dns_resolution_failure_social_network": {
         "verdict": "exclude",
@@ -115,44 +139,65 @@ PLATFORM_SUPPORT = {
         "requires": None,
     },
     "service_wrong_pod_selection_hotel_reservation": {
-        "verdict": "fixable",
-        "reason": "label and Service selector edits inside the app namespace only",
-        "requires": "anyuid grant for the app namespace",
+        "verdict": "works",
+        "reason": (
+            "passed the oracle lifecycle on ROSA 4.22.18 with a clean or owned damage verdict (logs/rosa-oracle-all): "
+            "label and Service selector edits inside the app namespace only"
+        ),
+        "requires": "anyuid grant for the app namespace; qualified image references (scripts/qualify_submodule_images.py)",
     },
     "namespace_memory_limit": {
-        "verdict": "fixable",
-        "reason": "a namespaced `ResourceQuota`; it refuses when a memory quota exists, and a fresh project is clean",
-        "requires": None,
+        "verdict": "works",
+        "reason": (
+            "passed the oracle lifecycle on ROSA 4.22.18 with a clean or owned damage verdict (logs/rosa-oracle-all): "
+            "a namespaced `ResourceQuota`; it refuses when a memory quota exists, and a fresh project is clean"
+        ),
+        "requires": "anyuid grant for the app namespace; qualified image references (scripts/qualify_submodule_images.py)",
     },
     "valkey_auth_disruption": {
-        "verdict": "fixable",
-        "reason": "`kubectl exec … CONFIG SET requirepass` inside the in-namespace Valkey pod",
-        "requires": None,
+        "verdict": "works",
+        "reason": (
+            "passed the oracle lifecycle on ROSA 4.22.18 with a clean or owned damage verdict (logs/rosa-oracle-all): "
+            "`kubectl exec ... CONFIG SET requirepass` inside the in-namespace Valkey pod"
+        ),
+        "requires": "anyuid grant for the app namespace",
     },
     "secret_rotation_stale_env_credentials_astronomy_shop": {
-        "verdict": "fixable",
-        "reason": "namespaced Secret, ConfigMap and env edits only",
+        "verdict": "works",
+        "reason": (
+            "passed the oracle lifecycle on ROSA 4.22.18 with a clean or owned damage verdict (logs/rosa-oracle-all): "
+            "namespaced Secret, ConfigMap and env edits only"
+        ),
         "requires": "anyuid grant for the app namespace",
     },
     "unschedulable_incorrect_port_assignment": {
-        "verdict": "fixable",
-        "reason": "a deliberate `nodeSelector` in the app namespace; it works the same",
-        "requires": None,
+        "verdict": "works",
+        "reason": (
+            "passed the oracle lifecycle on ROSA 4.22.18 with a clean or owned damage verdict (logs/rosa-oracle-all): "
+            "a deliberate `nodeSelector` in the app namespace"
+        ),
+        "requires": "anyuid grant for the app namespace",
     },
     "duplicate_pvc_mounts_social_network": {
-        "verdict": "fixable",
-        "reason": "the injector's PVC names no `storageClassName`, and RWO plus anti-affinity needs two or more workers",
-        "requires": "two or more schedulable workers",
+        "verdict": "works",
+        "reason": (
+            "passed the oracle lifecycle on ROSA 4.22.18 with a clean or owned damage verdict (logs/rosa-oracle-all): "
+            "RWO PVC plus anti-affinity, with the injector naming no `storageClassName`"
+        ),
+        "requires": "two or more schedulable workers; anyuid grant for the app namespace",
     },
     "rolling_update_misconfigured_social_network": {
-        "verdict": "fixable",
-        "reason": "the injector writes only qualified image references now; only a cluster run can move this verdict",
-        "requires": "qualified image references (plan item 8)",
+        "verdict": "works",
+        "reason": "passed end to end on ROSA 4.22.18 (validate_problem, damage verdict CLEAN) once the Social Network chart's nginx resolver names OpenShift's dns-default; the platform overlay supplies that",
+        "requires": "anyuid grant for the app namespace",
     },
     "search_rate_retry_collapse_hotel_reservation": {
-        "verdict": "fixable",
-        "reason": "env edits only; the load arrives through `kubectl port-forward`",
-        "requires": None,
+        "verdict": "works",
+        "reason": (
+            "passed the oracle lifecycle on ROSA 4.22.18 with a clean or owned damage verdict (logs/rosa-oracle-all): "
+            "env edits only; the load arrives through `kubectl port-forward`"
+        ),
+        "requires": "anyuid grant for the app namespace; qualified image references (scripts/qualify_submodule_images.py)",
     },
     # The ports carry the verdict of the fault they were adapted from. Where the
     # Lite reason is a chart pin of the Lite application, it does not transfer, so

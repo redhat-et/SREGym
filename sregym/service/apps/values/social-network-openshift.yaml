@@ -1,0 +1,6 @@
+# Applied on OpenShift only (Application.platform_helm_configs).
+# The chart default names the upstream kube-dns Service, which OpenShift does not have;
+# the cluster DNS Service is dns-default in openshift-dns. nginx resolves this name at start.
+global:
+  nginx:
+    resolverName: dns-default.openshift-dns.svc.cluster.local

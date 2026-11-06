@@ -68,6 +68,17 @@ from sregym.service.kubectl import KubeCtl
 from sregym.utils.decorators import mark_fault_injected
 
 _CONTROL_PLANE_LABELS = frozenset(["node-role.kubernetes.io/control-plane", "node-role.kubernetes.io/master"])
+_BLOCKING_TAINT_EFFECTS = frozenset(["NoSchedule", "NoExecute"])
+
+
+def _accepts_pods(node) -> bool:
+    """Return whether a pod without tolerations can be scheduled on `node`."""
+    spec = node.spec
+    if spec is None:
+        return True
+    if spec.unschedulable:
+        return False
+    return not any(taint.effect in _BLOCKING_TAINT_EFFECTS for taint in (spec.taints or []))
 
 
 class InternalTrafficPolicyLocalAstronomyShop(Problem):
@@ -130,11 +141,18 @@ class InternalTrafficPolicyLocalAstronomyShop(Problem):
     # ------------------------------------------------------------------
 
     def worker_nodes(self) -> list[str]:
-        """Return sorted list of worker node names (no control-plane)."""
+        """Return the sorted names of the nodes this scenario's pods can run on.
+
+        A control-plane node is not a worker, and neither is a node the pods cannot land on: a
+        `NoSchedule` or `NoExecute` taint (OpenShift's `infra` workers carry one) or a cordon.
+        The injector pins a Deployment to a node with a `nodeSelector`, and these pods have no
+        tolerations, so a pin on a tainted node leaves the pod Pending until the rollout times out.
+        The mitigation oracle asks this same method, so it never demands an endpoint on such a node.
+        """
         return sorted(
             node.metadata.name
             for node in self.kubectl.list_nodes().items
-            if not _CONTROL_PLANE_LABELS & set((node.metadata.labels or {}).keys())
+            if not _CONTROL_PLANE_LABELS & set((node.metadata.labels or {}).keys()) and _accepts_pods(node)
         )
 
     def _select_nodes(self) -> tuple[str, str]:

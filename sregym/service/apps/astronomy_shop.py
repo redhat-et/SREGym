@@ -13,6 +13,8 @@ from sregym.service.kubectl import KubeCtl
 
 
 class AstronomyShop(Application):
+    platform_overlay_key = "astronomy-shop"
+
     _HELM_REPOSITORIES = {
         "open-telemetry": "https://open-telemetry.github.io/opentelemetry-helm-charts",
         "jaegertracing": "https://jaegertracing.github.io/helm-charts",
@@ -80,7 +82,7 @@ class AstronomyShop(Application):
 
         self.helm_configs["extra_args"] = extra_args
 
-        Helm.install(**self.helm_configs)
+        Helm.install(**self.platform_helm_configs())
         Helm.assert_if_deployed(self.helm_configs["namespace"])
 
     def _read_flagd_config(self) -> dict[str, Any]:

@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -55,3 +56,36 @@ def test_connection_refresh_errors_do_not_report_successful_injection(fault, fai
     with pytest.raises(RuntimeError, match="backend refresh failed"):
         fault.inject_fault()
     assert fault.fault_injected is False
+
+
+def _node(name, *, labels=None, taints=(), unschedulable=False):
+    return SimpleNamespace(
+        metadata=SimpleNamespace(name=name, labels=labels or {}),
+        spec=SimpleNamespace(
+            unschedulable=unschedulable,
+            taints=[SimpleNamespace(key=k, effect=e) for k, e in taints],
+        ),
+    )
+
+
+def test_worker_nodes_skip_tainted_cordoned_and_control_plane_nodes():
+    """A pin on a node the pods cannot land on leaves the pod Pending until the rollout times out.
+
+    ROSA's `infra` workers carry a NoSchedule taint and sort before the plain workers, so the
+    first two names were the wrong ones.
+    """
+    problem = InternalTrafficPolicyLocalAstronomyShop.__new__(InternalTrafficPolicyLocalAstronomyShop)
+    problem.kubectl = Mock()
+    problem.kubectl.list_nodes.return_value = SimpleNamespace(
+        items=[
+            _node("a-infra", taints=[("node-role.kubernetes.io/infra", "NoSchedule")]),
+            _node("b-cordoned", unschedulable=True),
+            _node("c-master", labels={"node-role.kubernetes.io/master": ""}),
+            _node("d-evicting", taints=[("example", "NoExecute")]),
+            _node("e-worker"),
+            _node("f-worker", taints=[("example", "PreferNoSchedule")]),
+        ]
+    )
+
+    assert problem.worker_nodes() == ["e-worker", "f-worker"]
+    assert problem._select_nodes() == ("e-worker", "f-worker")

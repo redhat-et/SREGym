@@ -142,13 +142,14 @@ class FinalizerDeadlockController(Problem):
             raise TimeoutError(f"Controller did not delete ConfigMap `{self.configmap_name}` after RBAC recovery")
         print(f"ClusterRole `{self.clusterrole_name}` restored; controller completed cleanup")
 
-        # Recovery restores the fault; it does not remove the scenario's own objects.
-        # The ClusterRole and ClusterRoleBinding are cluster-scoped and would outlive
-        # the run, and a managed platform turns reconcile off, so nothing else would
-        # collect them. Removing them here is what makes the scenario leave no trace.
-        self._delete_support_resources()
-        print(f"Support resources removed; namespace {self.namespace} left as it was found")
-
+        # Recovery restores the fault only. The mitigation oracle runs AFTER this and needs the
+        # scenario's own controller, ServiceAccount and ClusterRole: it checks that the controller
+        # Deployment is healthy, then plants a fresh cleanup request that only that controller, with
+        # that RBAC, can clear. Deleting them here made the oracle report `controller_not_healthy`
+        # for a correctly recovered fault (measured on ROSA). The namespaced objects go with the
+        # namespace. The cluster-scoped ClusterRole and ClusterRoleBinding carry `sregym.io/owned`,
+        # so `--teardown-observers` and the survivor check collect them, and inject_fault removes
+        # any left by an earlier run before it starts.
         print(f"Resource: configmap/{self.configmap_name} | Namespace: {self.namespace}\n")
 
     def _create_service_account(self):

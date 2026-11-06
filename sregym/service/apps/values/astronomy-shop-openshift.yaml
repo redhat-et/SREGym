@@ -1,0 +1,22 @@
+# Applied to astronomy-shop on OpenShift only (Application.platform_helm_configs).
+#
+# The chart's bundled Grafana cannot be admitted as shipped. Its pod pins runAsUser/runAsGroup/fsGroup
+# 472 and every container sets seccompProfile RuntimeDefault. `anyuid` (granted to the namespace's
+# service accounts) rejects the seccomp setting, and `restricted-v2`/`restricted-v3` reject uid 472,
+# so no SCC admits the pod ("unable to validate against any security context constraint", measured on
+# ROSA 4.22.18). The ReplicaSet never creates a pod and `grafana` stays 0/1, which makes any oracle that
+# requires every Deployment to be rolled out (internal_traffic_policy_local) fail for the whole run.
+#
+# Fix: drop the three pinned ids and keep the rest. The pod then validates against `restricted-v2`,
+# which assigns a uid from the namespace range and accepts RuntimeDefault; `runAsNonRoot: true` and
+# the containers' `allowPrivilegeEscalation: false` stay. Helm deletes a key set to null on merge.
+#
+# Unproven until a cluster run: that the Grafana image starts under an arbitrary uid.
+# Fallback if it does not: `grafana: {enabled: false}`. Grafana is a UI with no consumer in this
+# repo (astronomy-shop-svelte.yaml drops it for that reason), and frontend-proxy's envoy tolerates
+# the unresolvable GRAFANA_HOST.
+grafana:
+  securityContext:
+    runAsUser: null
+    runAsGroup: null
+    fsGroup: null

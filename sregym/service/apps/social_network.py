@@ -15,6 +15,8 @@ logger.setLevel(logging.DEBUG)
 
 
 class SocialNetwork(Application):
+    platform_overlay_key = "social-network"
+
     def __init__(self):
         super().__init__(SOCIAL_NETWORK_METADATA)
         self.load_app_json()
@@ -61,7 +63,7 @@ class SocialNetwork(Application):
         """Deploy the same multiarch images on AMD64 and ARM64 nodes."""
         self.create_namespace()
         self.create_tls_secret()
-        Helm.install(**self.helm_configs)
+        Helm.install(**self.platform_helm_configs())
         Helm.assert_if_deployed(self.helm_configs["namespace"])
 
     def delete(self):

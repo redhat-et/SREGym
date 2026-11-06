@@ -17,6 +17,8 @@ from sregym.service.kubectl import KubeCtl
 
 
 class FleetCast(Application):
+    platform_overlay_key = "fleetcast"
+
     def __init__(self):
         super().__init__(FLEET_CAST_METADATA)
         self.load_app_json()
@@ -157,7 +159,7 @@ class FleetCast(Application):
             extra = [extra]
         self.helm_configs["extra_args"] = extra + ingress_args
 
-        Helm.install(**self.helm_configs)
+        Helm.install(**self.platform_helm_configs())
         Helm.assert_if_deployed(self.helm_configs["namespace"])
         print("---DEPLOYED FLEETCAST---")
 

@@ -10,6 +10,8 @@ from sregym.service.kubectl import KubeCtl
 
 
 class FlightTicket(Application):
+    platform_overlay_key = "flight-ticket"
+
     def __init__(self):
         super().__init__(FLIGHT_TICKET_METADATA)
         self.load_app_json()
@@ -32,7 +34,7 @@ class FlightTicket(Application):
             "flight-ticket",
             "https://xlab-uiuc.github.io/flight-ticket",
         )
-        Helm.install(**self.helm_configs)
+        Helm.install(**self.platform_helm_configs())
         Helm.assert_if_deployed(self.helm_configs["namespace"])
 
     def delete(self):

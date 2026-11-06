@@ -26,6 +26,9 @@ LITE_SETS = {
 
 # One per set, and the same fault in both: it rewrites kube-system/coredns, which
 # OpenShift does not serve DNS from.
+# Scenarios proven end to end on a real cluster: all 16 runnable Lite ones, the Incident Arena ports none.
+WORKS = {"sregym-lite": 16, "sregym-lite-ia": 0}
+
 EXCLUDED = {
     "sregym-lite": "service_dns_resolution_failure_social_network",
     "sregym-lite-ia": "service_dns_resolution_failure_slack_spine",
@@ -94,15 +97,20 @@ def test_the_excluded_problem_is_skipped_and_named_on_openshift(on_openshift, ca
 
     assert skipped == [EXCLUDED[suite]]
     output = capsys.readouterr().out
-    assert f"[openshift] {suite}: 0 works, 16 fixable, 1 exclude" in output
+    works = WORKS[suite]
+    assert f"[openshift] {suite}: {works} works, {16 - works} fixable, 1 exclude" in output
     assert f"[openshift] exclude: {EXCLUDED[suite]}:" in output
-    assert output.count("[openshift] fixable: ") == 16
+    assert output.count("[openshift] fixable: ") == 16 - works
     assert f"Skipping {EXCLUDED[suite]} in {suite}" in output
     assert "The rest of the suite runs" in output
 
 
 def test_a_suite_with_nothing_excluded_runs_whole(on_openshift, monkeypatch, capsys):
-    monkeypatch.setitem(on_openshift.PROBLEM_SETS, "synthetic-lite", ("network_policy_block", "namespace_memory_limit"))
+    monkeypatch.setitem(
+        on_openshift.PROBLEM_SETS,
+        "synthetic-lite",
+        ("network_policy_block_slack_spine", "env_variable_shadowing_saleor"),
+    )
 
     assert on_openshift.platform_support_skips("synthetic-lite") == []
 

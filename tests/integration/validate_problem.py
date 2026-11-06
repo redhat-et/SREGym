@@ -173,8 +173,10 @@ def validate(
         conductor.dependency_check(conductor.required_binaries())
         conductor.fix_kubernetes()
         conductor.undeploy_app()  # clear any leftovers from a previous run
-        conductor.deploy_app()
+        # Set before the call: a deploy that times out leaves the namespace and the pods
+        # behind, and the cleanup below must remove them.
         deployed = True
+        conductor.deploy_app()
         oracle.capture_baseline()
         stages["deploy"].status = PASS
         stages["deploy"].detail = f"`{problem.app.name}` deployed to namespace `{problem.namespace}`"
@@ -276,7 +278,7 @@ def validate(
             except Exception as exc:  # noqa: BLE001 - report the failure, do not mask the run
                 stages["teardown"].status = FAIL
                 stages["teardown"].detail = str(exc)
-            damage = conductor.cluster_damage_verdict(deleted_by_us=removed)
+            damage = conductor.cluster_damage_verdict(deleted_by_us=removed, after_teardown=True)
             damage.write(damage_json)
             stages["damage"].status = PASS if damage.harmless else FAIL
             stages["damage"].detail = damage.text().replace("\n", " ")

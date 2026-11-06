@@ -3,7 +3,10 @@ import logging
 from pathlib import Path
 from typing import Protocol
 
+from sregym.cluster_platform import is_openshift
 from sregym.paths import TARGET_MICROSERVICES
+
+PLATFORM_VALUES_DIR = Path(__file__).with_name("values")
 
 
 class WorkloadApplication(Protocol):
@@ -36,6 +39,30 @@ class Application:
         self.logger = logging.getLogger("all.application")
         self.logger.propagate = True
         self.logger.setLevel(logging.DEBUG)
+
+    # Stem of the platform overlay file: ``values/<key>-openshift.yaml``. None means no overlay.
+    platform_overlay_key: str | None = None
+
+    def platform_helm_configs(self) -> dict:
+        """Return a copy of ``helm_configs`` with the platform overlay added, if one exists.
+
+        On OpenShift, ``values/<platform_overlay_key>-openshift.yaml`` is appended to
+        ``extra_args`` as a ``-f`` file. With no key, no file, or another platform the
+        result equals ``helm_configs``. The overlay file is the whole registry: adding
+        one is the fix for an application that does not run unchanged on the platform.
+        """
+        configs = dict(self.helm_configs)
+        if not (is_openshift() and self.platform_overlay_key):
+            return configs
+        overlay = PLATFORM_VALUES_DIR / f"{self.platform_overlay_key}-openshift.yaml"
+        if not overlay.is_file():
+            return configs
+        extra = configs.get("extra_args") or []
+        if isinstance(extra, str):
+            extra = [extra]
+        configs["extra_args"] = [*extra, "-f", str(overlay)]
+        self.logger.info(f"[openshift] Applying platform values {overlay.name} to {self.name}")
+        return configs
 
     def deploy(self) -> None:
         """Deploy the application and require its expected healthy state."""

@@ -12,6 +12,8 @@ from sregym.service.kubectl import KubeCtl
 
 
 class TrainTicket(Application):
+    platform_overlay_key = "train-ticket"
+
     def __init__(self):
         super().__init__(str(TRAIN_TICKET_METADATA))
         self.load_app_json()
@@ -37,7 +39,7 @@ class TrainTicket(Application):
         if self.namespace:
             self.kubectl.create_namespace_if_not_exist(self.namespace)
 
-        Helm.install(**self.helm_configs)
+        Helm.install(**self.platform_helm_configs())
         self.kubectl.wait_for_job_completion(job_name="train-ticket-deploy", namespace="train-ticket", timeout=1800)
 
         self._deploy_flagd_infrastructure()

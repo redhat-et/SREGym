@@ -122,3 +122,21 @@ def test_failed_clusterrole_restore_still_clears_finalizer():
     problem._undo_finalizer_trap()
 
     assert calls == ["_force_clear_finalizer"]
+
+
+def test_recovery_keeps_the_controller_the_oracle_needs():
+    """The oracle runs after recover_fault and needs the controller and its ClusterRole.
+
+    Removing the support objects in recovery made a recovered fault read as
+    `controller_not_healthy`. Only the RBAC is restored; the ClusterRole and its binding are
+    cluster-scoped and owned-labelled, so the teardown collects them.
+    """
+    calls = []
+    problem = _problem(calls)
+    problem._restore_clusterrole = lambda: calls.append("_restore_clusterrole")
+    problem._wait_until_configmap_deleted = lambda timeout_seconds: calls.append("_wait") or True
+
+    problem.recover_fault()
+
+    assert calls == ["_restore_clusterrole", "_wait"]
+    assert "_delete_support_resources" not in calls

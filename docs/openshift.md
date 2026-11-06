@@ -90,23 +90,23 @@ excluded one fails at inject on this platform rather than being refused upfront.
 
 | Scenario | Verdict | Reason |
 |---|---|---|
-| `cronjob_sidecar_blocks_completion_hotel_reservation` | fixable | The injected sidecar image is qualified now and everything else is namespaced; only a cluster run can move this verdict. |
-| `edge_request_filter_cpu_saturation` | fixable | The chart pins `runAsUser: 101`, which `restricted-v2` rejects. |
-| `network_policy_block` | fixable | A namespaced NetworkPolicy only. Passed on ROSA with in-place branch edits. |
-| `env_variable_shadowing_astronomy_shop` | fixable | The chart pins `runAsUser: 1001`, which `restricted-v2` rejects. |
-| `mutating_webhook_resource_limits_social_network` | fixable | Five cluster-scoped `MutatingWebhookConfiguration` objects and namespace `platform-ops`. |
-| `finalizer_deadlock_controller_hotel_reservation` | fixable | The fault writes a `ClusterRole` and a `ClusterRoleBinding`. |
-| `kafka_poison_pill_hol_block` | fixable | `kubectl exec` into the in-namespace broker. The images are already qualified. |
-| `internal_traffic_policy_local_astronomy_shop` | fixable | Needs two or more schedulable workers. |
+| `cronjob_sidecar_blocks_completion_hotel_reservation` | **works** | The injected sidecar and every other change is namespaced. Needs: anyuid grant for the app namespace; qualified image references (scripts/qualify_submodule_images.py). |
+| `edge_request_filter_cpu_saturation` | **works** | `kubectl exec` only; the chart's `runAsUser: 101` is admitted under `anyuid`. Needs: anyuid grant for the app namespace. |
+| `network_policy_block` | **works** | A namespaced NetworkPolicy only. Needs: anyuid grant for the app namespace; qualified image references (scripts/qualify_submodule_images.py). |
+| `env_variable_shadowing_astronomy_shop` | **works** | Namespaced env edits; the chart's `runAsUser: 1001` is admitted under `anyuid`. Needs: anyuid grant for the app namespace. |
+| `mutating_webhook_resource_limits_social_network` | **works** | Five cluster-scoped `MutatingWebhookConfiguration` objects and namespace `platform-ops`, all removed at teardown. Needs: cluster-admin; anyuid grant for the app namespace. |
+| `finalizer_deadlock_controller_hotel_reservation` | **works** | Writes a `ClusterRole` and a `ClusterRoleBinding`; recovery keeps the controller the oracle needs and the teardown collects the owned RBAC. Needs: cluster-admin; anyuid grant for the app namespace; qualified image references (scripts/qualify_submodule_images.py). |
+| `kafka_poison_pill_hol_block` | **works** | `kubectl exec` into the in-namespace broker. Needs: anyuid grant for the app namespace. |
+| `internal_traffic_policy_local_astronomy_shop` | **works** | Pins a pod away from its caller; the node picker skips tainted and cordoned nodes (ROSA's infra workers). Needs: two or more untainted schedulable workers; anyuid grant for the app namespace. |
 | `service_dns_resolution_failure_social_network` | **exclude** | Writes `kube-system/coredns` and restarts `deployment coredns`; OpenShift serves DNS from `openshift-dns/dns-default`. |
-| `service_wrong_pod_selection_hotel_reservation` | fixable | Label and Service selector edits inside the app namespace only. |
-| `namespace_memory_limit` | fixable | A namespaced `ResourceQuota`. A fresh project is clean. |
-| `valkey_auth_disruption` | fixable | `kubectl exec … CONFIG SET requirepass` inside the in-namespace Valkey pod. |
-| `secret_rotation_stale_env_credentials_astronomy_shop` | fixable | Namespaced Secret, ConfigMap and env edits only. |
-| `unschedulable_incorrect_port_assignment` | fixable | A deliberate `nodeSelector` in the app namespace. It works the same. |
-| `duplicate_pvc_mounts_social_network` | fixable | The injector's PVC names no `storageClassName`, and RWO plus anti-affinity needs two or more workers. |
-| `rolling_update_misconfigured_social_network` | fixable | The injector writes only qualified image references now; only a cluster run can move this verdict. |
-| `search_rate_retry_collapse_hotel_reservation` | fixable | Env edits only. The load arrives through `kubectl port-forward`. |
+| `service_wrong_pod_selection_hotel_reservation` | **works** | Label and Service selector edits inside the app namespace only. Needs: anyuid grant for the app namespace; qualified image references (scripts/qualify_submodule_images.py). |
+| `namespace_memory_limit` | **works** | A namespaced `ResourceQuota`; it refuses when a memory quota exists, and a fresh project is clean. Needs: anyuid grant for the app namespace; qualified image references (scripts/qualify_submodule_images.py). |
+| `valkey_auth_disruption` | **works** | `kubectl exec ... CONFIG SET requirepass` inside the in-namespace Valkey pod. Needs: anyuid grant for the app namespace. |
+| `secret_rotation_stale_env_credentials_astronomy_shop` | **works** | Namespaced Secret, ConfigMap and env edits only. Needs: anyuid grant for the app namespace. |
+| `unschedulable_incorrect_port_assignment` | **works** | A deliberate `nodeSelector` in the app namespace. Needs: anyuid grant for the app namespace. |
+| `duplicate_pvc_mounts_social_network` | **works** | RWO PVC plus anti-affinity, with the injector naming no `storageClassName`. Needs: two or more schedulable workers; anyuid grant for the app namespace. |
+| `rolling_update_misconfigured_social_network` | **works** | Passed end to end on ROSA 4.22.18 with a CLEAN damage verdict. The chart's nginx resolver names `kube-dns.kube-system`, which OpenShift lacks; `values/social-network-openshift.yaml` points it at `dns-default.openshift-dns`. |
+| `search_rate_retry_collapse_hotel_reservation` | **works** | Env edits only; the load arrives through `kubectl port-forward`. Needs: anyuid grant for the app namespace; qualified image references (scripts/qualify_submodule_images.py). |
 
 The `sregym-lite-ia` ports carry the verdict of the fault they were adapted from, and only the DNS fault
 is excluded there. Where a reason above names a chart pin of the Lite application, the port names the
@@ -173,10 +173,13 @@ including what to do when the verdict is `damaged`.
 ## Where the measured facts come from
 
 One cluster only: a managed ROSA cluster, OpenShift 4.22.18, Kubernetes 1.35.8, reached with a
-**cluster-admin login**, and with unqualified image names edited in place. One scenario,
-`network_policy_block`, passed there. A restricted login has not been measured, so do not claim that
-SREGym needs no extra rights until it is. Every verdict in the table above is a reading of the code
-plus that single cluster, which is why the table says `fixable` rather than `works`.
+**cluster-admin login**. All 16 runnable Lite scenarios passed the oracle-only lifecycle there (deploy, inject,
+oracle fails, recover, oracle passes, clean up, damage verdict), with the unqualified image names
+qualified by `scripts/qualify_submodule_images.py` and `anyuid` granted to the three app namespaces. The log
+of each is under `logs/rosa-oracle-all/`. An agent run has passed for one scenario,
+`rolling_update_misconfigured_social_network`. A restricted login has not been measured, so do not claim that
+SREGym needs no extra rights until it is. Every `works` verdict above means the oracle lifecycle passed on that
+single cluster; it is not a measurement of agent behaviour, of other clusters, or of a restricted operator.
 
 Two consequences to keep in mind when you read a claim here:
 
