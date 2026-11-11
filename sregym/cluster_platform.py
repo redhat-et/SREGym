@@ -102,8 +102,8 @@ def serves_metrics_api() -> bool:
 def restricted_admission() -> bool:
     """Return True when workloads are admitted under restricted-v2 SCCs.
 
-    True on ``openshift``. This predicate only records the fact; the SCC
-    preflight that acts on it belongs to a later change. Ask the platform this,
+    True on ``openshift``. The SCC preflight in
+    ``sregym.service.admission_preflight`` acts on it. Ask the platform this,
     not ``is_openshift()`` at every call site.
     """
     return get_platform() == OPENSHIFT
@@ -117,6 +117,34 @@ def pins_control_plane() -> bool:
     change. Ask the platform this, not ``is_openshift()`` at every call site.
     """
     return get_platform() == KIND
+
+
+NOISE_UNAVAILABLE = (
+    "--noise installs Chaos Mesh, whose privileged chaos-daemon needs an SCC the harness never grants, patches "
+    "the daemon's tolerations and strips the finalizers of every chaos resource in every namespace, and was never "
+    "run on OpenShift. Its container-runtime detection also does not recognise CRI-O (cri-o://). Without a guard "
+    "the install fails quietly and the run reports a result with no noise in it"
+)
+
+
+def supports_noise() -> bool:
+    """Return True when the Chaos Mesh noise backend may run.
+
+    True on ``kind`` only. On ``openshift`` it is refused, loudly, instead of degrading to a
+    run that claims noise it did not inject; see ``NOISE_UNAVAILABLE`` and ``docs/openshift.md``.
+    Ask the platform this, not ``is_openshift()`` at every call site.
+    """
+    return get_platform() == KIND
+
+
+def require_noise_support() -> None:
+    """Raise when the platform cannot run the Chaos Mesh backend.
+
+    The one check every install path calls first, so a scenario that installs Chaos Mesh without
+    ``--noise`` is refused for the same reason as the flag.
+    """
+    if not supports_noise():
+        raise RuntimeError(f"Chaos Mesh is not supported on {get_platform()}: {NOISE_UNAVAILABLE}.")
 
 
 def verify_platform_matches_cluster(discover, *, log=None) -> str:

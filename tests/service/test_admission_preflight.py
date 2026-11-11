@@ -20,8 +20,10 @@ from sregym.service.admission_preflight import (
     CANNOT_VERIFY,
     GRANTED,
     MISSING,
+    check_promtail_privileged,
     check_scc_grant,
     grant_commands,
+    promtail_grant_command,
 )
 
 MODULE_LOGGER = "all.sregym.admission_preflight"
@@ -254,3 +256,56 @@ def test_discovery_failure_keeps_the_strict_path():
 
     assert result.state == GRANTED
     kubectl.authorization_v1_api.create_subject_access_review.assert_called_once()
+
+
+# ------------------------------------------------------ Promtail's privileged SCC (warn-only)
+
+
+def test_the_promtail_review_asks_about_the_service_account_user():
+    """The documented grant is `add-scc-to-user -z promtail`, so a group-only review would always say no."""
+    kubectl = _kubectl(_review(True))
+
+    assert check_promtail_privileged(kubectl) is True
+
+    spec = kubectl.authorization_v1_api.create_subject_access_review.call_args.args[0].spec
+    assert spec.user == "system:serviceaccount:observe:promtail"
+    assert spec.resource_attributes.name == "privileged"
+    assert spec.resource_attributes.verb == "use"
+    _assert_nothing_was_changed(kubectl)
+
+
+def test_the_promtail_command_is_the_exact_documented_one():
+    assert promtail_grant_command() == "oc adm policy add-scc-to-user privileged -z promtail -n observe"
+
+
+def test_the_promtail_check_is_unknown_when_the_review_is_refused_or_there_is_no_scc_api():
+    assert check_promtail_privileged(_kubectl(ApiException(status=403, reason="Forbidden"))) is None
+
+    plain = MagicMock()
+    plain.apis_api.get_api_versions.return_value.groups = [SimpleNamespace(name="apps")]
+    assert check_promtail_privileged(plain) is None
+    plain.authorization_v1_api.create_subject_access_review.assert_not_called()
+
+
+def test_a_missing_promtail_grant_warns_and_never_refuses(monkeypatch, caplog):
+    conductor = _conductor(
+        monkeypatch, OPENSHIFT, _kubectl(_review(True), _review(True), _review(True), _review(False))
+    )
+    conductor.config = SimpleNamespace(deploy_loki=True)
+
+    with caplog.at_level(logging.WARNING, logger="test.admission_preflight"):
+        conductor._verify_scc_grant()  # anyuid granted for three namespaces; promtail answers no
+
+    assert "unmeasured prerequisite" in caplog.text
+    assert promtail_grant_command() in caplog.text
+
+
+def test_the_promtail_warning_is_skipped_without_loki(monkeypatch, caplog):
+    conductor = _conductor(monkeypatch, OPENSHIFT, _kubectl(_review(False)))
+    conductor.config = SimpleNamespace(deploy_loki=False)
+    conductor.kubectl.authorization_v1_api.create_subject_access_review.side_effect = [_review(True)] * 3
+
+    with caplog.at_level(logging.WARNING, logger="test.admission_preflight"):
+        conductor._verify_scc_grant()
+
+    assert "unmeasured prerequisite" not in caplog.text

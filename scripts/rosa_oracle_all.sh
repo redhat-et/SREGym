@@ -15,14 +15,8 @@ set -u
 OUT="${1:-logs/rosa-oracle-all}"
 mkdir -p "$OUT"
 
-echo "== Qualify image references in the submodule manifests =="
-uv run python scripts/qualify_submodule_images.py --apply || exit 1
-
-echo "== Grant anyuid to the app namespaces (idempotent; the grant outlives the namespace) =="
-command -v oc >/dev/null || { echo "oc not found"; exit 1; }
-for ns in social-network hotel-reservation astronomy-shop; do
-  oc adm policy add-scc-to-group anyuid "system:serviceaccounts:$ns" || exit 1
-done
+echo "== Operator prerequisites (image qualification, anyuid grants) =="
+bash "$(dirname "$0")/rosa_prerun.sh" || exit 1
 
 echo "== Platform support check (no cluster access) =="
 SREGYM_PLATFORM=openshift uv run python -c "import main; main.platform_support_skips('sregym-lite')" | grep Skipping

@@ -29,11 +29,13 @@ from sregym.agent_launcher import AgentLauncher
 from sregym.agent_registry import get_agent, list_agents
 from sregym.cluster_platform import (
     KIND,
+    NOISE_UNAVAILABLE,
     PLATFORMS,
     PlatformVerificationError,
     get_platform,
     is_openshift,
     set_platform,
+    supports_noise,
 )
 from sregym.conductor.conductor import (
     ALL_STAGES,
@@ -1087,6 +1089,17 @@ def internet_access_refusal(policy: InternetPolicy, agent_name: str | None = Non
     )
 
 
+def noise_refusal(noise: bool) -> str | None:
+    """Return the refusal for --noise on a platform that cannot run it, or None.
+
+    The conductor swallows noise start errors into warnings, so this argument check is the
+    guard that makes the flag effective: it stops the run before any cluster write.
+    """
+    if not noise or supports_noise():
+        return None
+    return f"Refusing --noise on {get_platform()}: {NOISE_UNAVAILABLE}. Re-run without --noise."
+
+
 def platform_support_skips(suite: str | None) -> list[str]:
     """Print the OpenShift support summary for a named suite and name what it cannot run.
 
@@ -1178,6 +1191,9 @@ def _run_benchmark(args, *, judge_backend: str = "api", agent_image: str | None 
     refusal = reconcile_refusal(getattr(args, "reconcile", None), getattr(args, "confirm_destructive_reconcile", False))
     if refusal:
         sys.exit(refusal)
+    noise_block = noise_refusal(getattr(args, "noise", False))
+    if noise_block:
+        sys.exit(noise_block)
     internet_policy = InternetPolicy.from_mode(
         args.internet_access,
         agent_name=args.agent,

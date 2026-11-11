@@ -39,6 +39,13 @@ SCC_NAME = "anyuid"
 SCC_API_GROUP = "security.openshift.io"
 SCC_RESOURCE = "securitycontextconstraints"
 
+# Promtail reads the node's pod logs through hostPath mounts and runs as uid 0. The upstream
+# worktree's ROSA notes record it admitted by the `privileged` SCC with no binding of ours, on a
+# cluster-admin login, so this grant is an unmeasured prerequisite and never a refusal.
+PRIVILEGED_SCC = "privileged"
+PROMTAIL_NAMESPACE = "observe"
+PROMTAIL_SERVICE_ACCOUNT = "promtail"
+
 GRANTED = "granted"
 MISSING = "missing"
 CANNOT_VERIFY = "cannot_verify"
@@ -47,6 +54,11 @@ CANNOT_VERIFY = "cannot_verify"
 def grant_command(namespace: str) -> str:
     """Return the exact command that grants the `anyuid` SCC to a namespace's service accounts."""
     return f"oc adm policy add-scc-to-group {SCC_NAME} system:serviceaccounts:{namespace}"
+
+
+def promtail_grant_command() -> str:
+    """Return the exact command that grants the `privileged` SCC to Promtail's service account."""
+    return f"oc adm policy add-scc-to-user {PRIVILEGED_SCC} -z {PROMTAIL_SERVICE_ACCOUNT} -n {PROMTAIL_NAMESPACE}"
 
 
 def grant_commands(namespaces: Iterable[str]) -> list[str]:
@@ -130,6 +142,42 @@ def check_scc_grant(kubectl, namespaces: Iterable[str]) -> PreflightResult:
     result = PreflightResult(tuple(ordered), tuple(missing), tuple(unverified))
     _log(result)
     return result
+
+
+def check_promtail_privileged(kubectl) -> bool | None:
+    """Return whether Promtail's service account may use `privileged`, or None when unknown.
+
+    Answers None on a cluster without the SCC API and when the review is refused (403), the
+    same two cases `check_scc_grant` reports as unverifiable. The subject is the service
+    account user, because the documented grant is `add-scc-to-user -z promtail`; a review for
+    the namespace group would answer false for a user binding. Read-only: nothing is granted.
+    """
+    if not serves_scc_api(kubectl):
+        return None
+    user = f"system:serviceaccount:{PROMTAIL_NAMESPACE}:{PROMTAIL_SERVICE_ACCOUNT}"
+    review = client.V1SubjectAccessReview(
+        spec=client.V1SubjectAccessReviewSpec(
+            user=user,
+            groups=[
+                "system:serviceaccounts",
+                f"system:serviceaccounts:{PROMTAIL_NAMESPACE}",
+                "system:authenticated",
+            ],
+            resource_attributes=client.V1ResourceAttributes(
+                group=SCC_API_GROUP,
+                resource=SCC_RESOURCE,
+                name=PRIVILEGED_SCC,
+                verb="use",
+            ),
+        )
+    )
+    try:
+        answer = kubectl.authorization_v1_api.create_subject_access_review(review)
+    except ApiException as exc:
+        if exc.status != 403:
+            raise
+        return None
+    return bool(answer.status and answer.status.allowed)
 
 
 def _anyuid_use_allowed(kubectl, namespace: str) -> bool | None:

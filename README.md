@@ -67,7 +67,7 @@ Choose either a) or b) to set up your cluster and then proceed to the next steps
 SREGym runs on a self-managed Kubernetes cluster that you provision on Linux hosts you have SSH and root access to (e.g. [CloudLab](https://www.cloudlab.us/), bare-metal machines, or cloud VMs/VPS instances). We provide an Ansible playbook that builds the cluster for you. Follow this [README](./scripts/ansible/README.md) to set it up.
 
 > [!NOTE]
-> A managed Kubernetes service won't work out of the box, since SREGym's setup needs SSH and root access to the nodes for OS-level cluster configuration. Instead, spin up a few plain VMs/VPS instances and add them to `inventory.yml`.
+> A managed Kubernetes service won't work out of the box, since SREGym's setup needs SSH and root access to the nodes for OS-level cluster configuration. Instead, spin up a few plain VMs/VPS instances and add them to `inventory.yml`. The exception is OpenShift: see c) below.
 
 ### b) Emulated cluster
 SREGym can be run on an emulated cluster using [kind](https://kind.sigs.k8s.io/) on your local machine. However, not all problems are supported.
@@ -82,6 +82,16 @@ bash kind/setup_kind_cluster.sh
 ```
 
 For existing clusters, see the [upgrade and baseline instructions](./docs/network-access.md#cluster-maintenance).
+
+### c) OpenShift
+SREGym can run on a managed OpenShift cluster. It has been measured on one managed ROSA cluster with a cluster-admin login, and not on a restricted login. The default stays `kind` and its behaviour is unchanged.
+
+- Declare the platform with `--platform openshift`. The cluster has to confirm it.
+- Pass `--storage-class <the cluster's own class>`. The default class names OpenEBS, and the harness refuses it on OpenShift.
+- Pass `--internet-access open` for agent runs. Filtered access needs a network tier that OpenShift's OVN-Kubernetes does not provide.
+- `--noise` (Chaos Mesh) is refused on OpenShift. Once per cluster, an operator runs `scripts/rosa_prerun.sh`.
+
+Support, refusals and unverified claims are in [docs/openshift.md](./docs/openshift.md).
 
 <h2 id="⚙️usage">⚙️ Usage</h2>
 

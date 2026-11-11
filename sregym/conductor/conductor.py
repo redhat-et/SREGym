@@ -46,7 +46,13 @@ from sregym.observer.otel_collector import OtelCollector
 from sregym.paths import BASE_DIR, CLUSTER_BASELINE_STATE_FILE
 from sregym.phases import PhaseLedger
 from sregym.profile import is_svelte
-from sregym.service.admission_preflight import MISSING, check_scc_grant, grant_commands
+from sregym.service.admission_preflight import (
+    MISSING,
+    check_promtail_privileged,
+    check_scc_grant,
+    grant_commands,
+    promtail_grant_command,
+)
 from sregym.service.apps.app_registry import AppRegistry
 from sregym.service.capacity_preflight import check_capacity
 from sregym.service.cluster_egress import ClusterEgressBoundary
@@ -614,6 +620,25 @@ class Conductor:
         # `cannot_verify` is already reported by the preflight, with the same commands,
         # and the run continues: SCC objects and their bindings are cluster-scoped, so a
         # project-scoped identity cannot read them.
+        self._warn_promtail_privileged()
+
+    def _warn_promtail_privileged(self) -> None:
+        """Say once that Promtail's `privileged` grant is an unmeasured prerequisite.
+
+        Warn-only, and only when this run deploys Loki. Promtail mounts the node's pod logs
+        through hostPath; the only ROSA evidence in hand shows it admitted without a binding of
+        ours, on a cluster-admin login. A restricted login has not been measured, so a missing
+        grant is reported, never refused, and the harness never runs the command it prints.
+        """
+        if not getattr(getattr(self, "config", None), "deploy_loki", False):
+            return
+        if check_promtail_privileged(self.kubectl) is False:
+            self.logger.warning(
+                "The privileged SCC is not granted to the promtail service account in observe. This is an "
+                "unmeasured prerequisite: Promtail may be admitted without it. If Loki shows no log lines, an "
+                "operator grants it once the first Loki deploy has created the service account:\n%s",
+                promtail_grant_command(),
+            )
 
     def _run_namespaces(self) -> list[str]:
         """Every namespace this run deploys into, deduplicated, in deployment order.
@@ -625,7 +650,7 @@ class Conductor:
         whose app is not attached, answers for what it does know instead of failing
         inside a preflight.
         """
-        problem = getattr(self, "current_problem", None)
+        problem = getattr(self, "problem", None)
         app = getattr(problem, "app", None)
         components = (getattr(self, "prometheus", None), getattr(self, "mcp_server", None))
         namespaces = [

@@ -7,6 +7,8 @@ checked here on the files themselves; `test_prometheus_overlay_render.py` checks
 what Helm actually makes of them.
 """
 
+from urllib.parse import urlsplit
+
 import pytest
 import yaml
 
@@ -23,7 +25,7 @@ PROMTAIL_OVERLAY = BASE_DIR / "observer/loki/promtail-values-openshift.yaml"
 OVERLAYS = [PROMETHEUS_OVERLAY, LOKI_OVERLAY, PROMTAIL_OVERLAY]
 
 PIN = "node-role.kubernetes.io/control-plane"
-LOKI_PUSH_URL = "http://loki.observe.svc.cluster.local:3100"
+LOKI_PUSH_URL = "http://loki.observe.svc.cluster.local:3100/loki/api/v1/push"
 
 
 @pytest.fixture(autouse=True)
@@ -133,6 +135,20 @@ def test_promtail_overlay_empties_the_tolerations_and_moves_the_client():
     assert set(overlay) == {"tolerations", "config"}
     assert overlay["tolerations"] == []
     assert overlay["config"]["clients"] == [{"url": LOKI_PUSH_URL}]
+
+
+def test_the_overlay_push_url_keeps_the_kind_push_path():
+    """Promtail posts to the URL it is given and appends nothing, so a client URL without the path
+    is accepted by the chart, reports Ready, and ingests nothing. The overlay changes the host only."""
+    kind = yaml.safe_load((BASE_DIR / "observer/loki/promtail-values.yaml").read_text())["config"]["clients"][0]["url"]
+    kind_path = urlsplit(kind).path
+    assert kind_path == "/loki/api/v1/push"
+
+    for overlay in (
+        overlay_values(PROMTAIL_OVERLAY)["config"]["clients"],
+        overlay_values(LOKI_OVERLAY)["promtail"]["config"]["clients"],
+    ):
+        assert urlsplit(overlay[0]["url"]).path == kind_path
 
 
 # --------------------------------------------------------------------------------- wiring

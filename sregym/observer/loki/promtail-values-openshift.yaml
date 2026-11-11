@@ -11,4 +11,4 @@ tolerations: []
 # values-openshift.yaml in this directory for why the gateway is off.
 config:
   clients:
-    - url: http://loki.observe.svc.cluster.local:3100
+    - url: http://loki.observe.svc.cluster.local:3100/loki/api/v1/push

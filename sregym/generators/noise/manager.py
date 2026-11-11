@@ -21,6 +21,7 @@ from typing import Any
 
 import yaml
 
+from sregym.cluster_platform import require_noise_support
 from sregym.generators.noise.catalog import EXPERIMENT_CATALOG
 from sregym.service.kubectl import KubeCtl
 
@@ -342,6 +343,8 @@ class NoiseManager:
 
     def _ensure_chaos_mesh_installed(self):
         """Check if Chaos Mesh is installed; install if missing."""
+        # Outside the try below: a guard that is logged and swallowed is the failure it prevents.
+        require_noise_support()
         self._chaos_mesh_ready = False
         try:
             ns_check = self.kubectl.exec_command(f"kubectl get ns {CHAOS_NAMESPACE}")

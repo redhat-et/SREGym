@@ -3,6 +3,7 @@ from pathlib import Path
 
 import yaml
 
+from sregym.cluster_platform import require_noise_support
 from sregym.generators.noise.manager import get_noise_manager
 from sregym.service.helm import Helm
 from sregym.service.kubectl import KubeCtl
@@ -10,6 +11,8 @@ from sregym.service.kubectl import KubeCtl
 
 class ChaosInjector:
     def __init__(self, namespace: str):
+        # Before any API call, so a refused platform is not left with a half-installed Chaos Mesh.
+        require_noise_support()
         self.namespace = namespace
         self.kubectl = KubeCtl()
         self.kubectl.create_namespace_if_not_exist("chaos-mesh")
