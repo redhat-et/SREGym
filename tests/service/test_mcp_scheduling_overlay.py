@@ -16,7 +16,7 @@ from sregym.cluster_platform import OPENSHIFT
 from sregym.paths import MCP_SERVER_K8S
 from sregym.service.kubernetes_access_policy import restricted_cluster_role
 from sregym.service.mcp_server import MCPServer
-from sregym.service.owned_objects import OWNED_LABEL, OWNED_VALUE
+from sregym.service.owned_objects import INFRA_LABEL, INFRA_VALUE
 
 NODE_SCHEDULING_KEYS = ("nodeSelector", "tolerations")
 
@@ -87,10 +87,10 @@ def test_the_cluster_role_branch_is_unaffected(rendered_manifests, filtered):
 
     assert cluster_roles() == kind_roles
     original = yaml.safe_load((MCP_SERVER_K8S / "clusterrole.yaml").read_text())
-    # Every applied resource now carries the ownership label, which is what lets the teardown
-    # remove it by ownership rather than by name. Compare with that label set aside, so this
+    # Every applied resource now carries the harness infrastructure label, which is what lets the
+    # teardown remove it by label rather than by name. Compare with that label set aside, so this
     # test keeps its subject: the platform transform.
     for role in kind_roles:
-        assert role["metadata"]["labels"][OWNED_LABEL] == OWNED_VALUE
-        role["metadata"]["labels"].pop(OWNED_LABEL)
+        assert role["metadata"]["labels"][INFRA_LABEL] == INFRA_VALUE
+        role["metadata"]["labels"].pop(INFRA_LABEL)
     assert kind_roles == [restricted_cluster_role(original) if filtered else original]

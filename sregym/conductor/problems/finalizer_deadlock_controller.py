@@ -14,6 +14,7 @@ from sregym.conductor.problems.base import Problem
 from sregym.service.apps.base import Application
 from sregym.service.apps.hotel_reservation import HotelReservation
 from sregym.service.kubectl import KubeCtl
+from sregym.service.ownership_ledger import OwnershipLedger, delete_owned, uid_of_object
 from sregym.service.rollout import deployment_rollout_complete
 from sregym.utils.decorators import mark_fault_injected
 
@@ -25,11 +26,7 @@ _CLUSTERROLEBINDING_NAME = "configmap-cleanup-controller"
 _CONFIGMAP_NAME = "reservation-cleanup-token"
 _FINALIZER = "cleanup.reservations.io/pending-cleanup"
 _CONTROLLER_IMAGE = "docker.io/python:3.12-alpine"
-# Two labels on purpose: `managed-by` is the scenario's own bookkeeping, and the
-# ownership label is what lets a teardown remove these objects when the run that
-# created them died before recovery. Without it the ClusterRole and
-# ClusterRoleBinding below survive every run that does not reach recover_fault.
-_MANAGED_LABELS = {"app.kubernetes.io/managed-by": _CONTROLLER_NAME, "sregym.io/owned": "true"}
+_MANAGED_LABELS = {"app.kubernetes.io/managed-by": _CONTROLLER_NAME}
 
 
 def _correct_clusterrole_rules():
@@ -147,9 +144,9 @@ class FinalizerDeadlockController(Problem):
         # Deployment is healthy, then plants a fresh cleanup request that only that controller, with
         # that RBAC, can clear. Deleting them here made the oracle report `controller_not_healthy`
         # for a correctly recovered fault (measured on ROSA). The namespaced objects go with the
-        # namespace. The cluster-scoped ClusterRole and ClusterRoleBinding carry `sregym.io/owned`,
-        # so `--teardown-observers` and the survivor check collect them, and inject_fault removes
-        # any left by an earlier run before it starts.
+        # namespace. The cluster-scoped ClusterRole and ClusterRoleBinding are recorded in the run's
+        # ownership ledger, so teardown and the survivor check find them by UID, and inject_fault
+        # removes any the ledger recorded from an earlier run before it starts.
         print(f"Resource: configmap/{self.configmap_name} | Namespace: {self.namespace}\n")
 
     def _create_service_account(self):
@@ -179,12 +176,21 @@ class FinalizerDeadlockController(Problem):
             rules=rules,
         )
         try:
-            self.rbac_v1.create_cluster_role(body=body, _request_timeout=10)
+            created = self.rbac_v1.create_cluster_role(body=body, _request_timeout=10)
         except ApiException as e:
-            if e.status == 409:
-                self._replace_clusterrole(rules)
-            else:
+            if e.status != 409:
                 raise
+            existing = self.rbac_v1.read_cluster_role(name=self.clusterrole_name, _request_timeout=10)
+            self._ledger().require_owned(
+                "clusterrole", self.clusterrole_name, uid_of_object(existing), action="replace"
+            )
+            self._replace_clusterrole(rules)
+            return
+        self._ledger().record("clusterrole", self.clusterrole_name, uid_of_object(created), owner=_CONTROLLER_NAME)
+
+    def _ledger(self) -> OwnershipLedger:
+        """The run's ownership ledger. Built on each call so it follows the current SREGYM_OWNERSHIP_LEDGER."""
+        return OwnershipLedger()
 
     def _replace_clusterrole(self, rules):
         body = client.V1ClusterRole(
@@ -230,16 +236,29 @@ class FinalizerDeadlockController(Problem):
             ],
         }
         try:
-            self.rbac_v1.create_cluster_role_binding(body=body, _request_timeout=10)
+            created = self.rbac_v1.create_cluster_role_binding(body=body, _request_timeout=10)
         except ApiException as e:
-            if e.status == 409:
-                self.rbac_v1.replace_cluster_role_binding(
-                    name=self.clusterrolebinding_name,
-                    body=body,
-                    _request_timeout=10,
-                )
-            else:
+            if e.status != 409:
                 raise
+            existing = self.rbac_v1.read_cluster_role_binding(
+                name=self.clusterrolebinding_name,
+                _request_timeout=10,
+            )
+            self._ledger().require_owned(
+                "clusterrolebinding", self.clusterrolebinding_name, uid_of_object(existing), action="replace"
+            )
+            self.rbac_v1.replace_cluster_role_binding(
+                name=self.clusterrolebinding_name,
+                body=body,
+                _request_timeout=10,
+            )
+            return
+        self._ledger().record(
+            "clusterrolebinding",
+            self.clusterrolebinding_name,
+            uid_of_object(created),
+            owner=_CONTROLLER_NAME,
+        )
 
     def _create_controller_script(self):
         script = textwrap.dedent(
@@ -580,16 +599,29 @@ class FinalizerDeadlockController(Problem):
         with _ignore_not_found():
             self._force_clear_finalizer()
         self._wait_until_configmap_deleted(timeout_seconds=30)
-        with _ignore_not_found():
-            self.rbac_v1.delete_cluster_role_binding(
+        # Cluster-scoped objects go only if this run's ledger recorded them, and only the object
+        # with the recorded UID. A same-named object that is not ours is left alone.
+        ledger = self._ledger()
+        delete_owned(
+            ledger,
+            "clusterrolebinding",
+            self.clusterrolebinding_name,
+            lambda body: self.rbac_v1.delete_cluster_role_binding(
                 name=self.clusterrolebinding_name,
+                body=body,
                 _request_timeout=10,
-            )
-        with _ignore_not_found():
-            self.rbac_v1.delete_cluster_role(
+            ),
+        )
+        delete_owned(
+            ledger,
+            "clusterrole",
+            self.clusterrole_name,
+            lambda body: self.rbac_v1.delete_cluster_role(
                 name=self.clusterrole_name,
+                body=body,
                 _request_timeout=10,
-            )
+            ),
+        )
         with _ignore_not_found():
             self.kubectl.core_v1_api.delete_namespaced_service_account(
                 name=self.sa_name,

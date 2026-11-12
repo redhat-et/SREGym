@@ -53,7 +53,11 @@ from sregym.conductor.problems.base import Problem
 from sregym.service.apps.base import Application
 from sregym.service.apps.social_network import SocialNetwork
 from sregym.service.kubectl import KubeCtl
+from sregym.service.ownership_ledger import OwnershipLedger, delete_owned, uid_of_object
 from sregym.utils.decorators import mark_fault_injected
+
+_WEBHOOK_KIND = "mutatingwebhookconfiguration"
+_NAMESPACE_KIND = "namespace"
 
 
 class MutatingWebhookResourceLimits(Problem):
@@ -373,13 +377,6 @@ httpd.serve_forever()
 
         manifest = f"""
 apiVersion: v1
-kind: Namespace
-metadata:
-  name: {self.BACKEND_SVC_NAMESPACE}
-  labels:
-    sregym.io/owned: "true"
----
-apiVersion: v1
 kind: Secret
 metadata:
   name: {self.BACKEND_SVC_NAME}-tls
@@ -455,7 +452,7 @@ spec:
     targetPort: 8443
 """
 
-        self._refuse_foreign_platform_namespace()
+        self._create_backend_namespace()
         self._run(["kubectl", "apply", "-f", "-"], input=manifest)
         self._run(
             [
@@ -469,28 +466,30 @@ spec:
             ]
         )
 
-    def _refuse_foreign_platform_namespace(self) -> None:
-        """Refuse to adopt, and later delete, a `platform-ops` this harness did not create.
+    def _ownership_ledger(self) -> OwnershipLedger:
+        """The run's ledger of objects this harness created, matched by UID (see ownership_ledger)."""
+        return OwnershipLedger()
 
-        Recovery deletes this namespace by name. `apply` would silently adopt a pre-existing one,
-        and the run would then delete somebody else's namespace on the way out -- a removal no
-        verdict can undo. Ownership is read from the label the harness sets, so a namespace of
-        the same name that belongs to another owner stops the run instead of being taken over.
+    def _create_backend_namespace(self) -> None:
+        """Create the backend namespace and record the UID the API server assigned it.
+
+        Recovery deletes this namespace by name, so a namespace this run did not create is never
+        adopted: `apply` would take it over and the run would delete it on the way out. A namespace
+        that already exists is reused only when the ledger records this exact object.
         """
+        ledger = self._ownership_ledger()
+        name = self.BACKEND_SVC_NAMESPACE
+        namespace = client.V1Namespace(metadata=client.V1ObjectMeta(name=name))
         try:
-            existing = self.kubectl.core_v1_api.read_namespace(name=self.BACKEND_SVC_NAMESPACE)
+            created = self.core_api.create_namespace(body=namespace)
         except ApiException as e:
-            if e.status == 404:
-                return
-            raise
-        labels = (existing.metadata.labels or {}) if existing.metadata else {}
-        if labels.get("sregym.io/owned") == "true":
+            if e.status != 409:
+                raise
+            existing = self.core_api.read_namespace(name=name)
+            ledger.require_owned(_NAMESPACE_KIND, name, uid_of_object(existing), action="adopt")
+            print(f"Namespace {name} is this run's own leftover; reusing it")
             return
-        raise RuntimeError(
-            f"Namespace {self.BACKEND_SVC_NAMESPACE!r} already exists and was not created by SREGym "
-            f"(labels: {labels or '{}'}). This scenario deletes that namespace when it recovers, so it "
-            "will not adopt one it does not own. Remove it, or run this scenario elsewhere."
-        )
+        ledger.record(_NAMESPACE_KIND, name, uid_of_object(created), owner=type(self).__name__)
 
     def _build_webhook_body(self) -> dict:
         if not self.ca_bundle:
@@ -499,7 +498,7 @@ spec:
         return {
             "apiVersion": "admissionregistration.k8s.io/v1",
             "kind": "MutatingWebhookConfiguration",
-            "metadata": {"name": self.WEBHOOK_NAME, "labels": {"sregym.io/owned": "true"}},
+            "metadata": {"name": self.WEBHOOK_NAME},
             "webhooks": [
                 {
                     "name": self.WEBHOOK_FQDN,
@@ -583,32 +582,61 @@ spec:
         """Install all DECOY_WEBHOOKS. Idempotent: existing decoys are replaced
         in-place so re-running inject_fault never errors on the second pass."""
         print(f"[Decoys] Installing {len(self.DECOY_WEBHOOKS)} decoy MutatingWebhookConfigurations")
+        ledger = self._ownership_ledger()
         for spec in self.DECOY_WEBHOOKS:
+            name = spec["name"]
             body = self._build_decoy_webhook_body(spec)
             try:
-                self.admission_api.create_mutating_webhook_configuration(body=body)
-                print(f"  Created decoy: {spec['name']}")
+                created = self.admission_api.create_mutating_webhook_configuration(body=body)
+                ledger.record(_WEBHOOK_KIND, name, uid_of_object(created), owner=type(self).__name__)
+                print(f"  Created decoy: {name}")
             except ApiException as e:
-                if e.status == 409:
-                    existing = self.admission_api.read_mutating_webhook_configuration(name=spec["name"])
-                    body["metadata"]["resourceVersion"] = existing.metadata.resource_version
-                    self.admission_api.replace_mutating_webhook_configuration(name=spec["name"], body=body)
-                    print(f"  Replaced decoy: {spec['name']}")
-                else:
+                if e.status != 409:
                     raise
+                existing = self.admission_api.read_mutating_webhook_configuration(name=name)
+                ledger.require_owned(_WEBHOOK_KIND, name, uid_of_object(existing), action="replace")
+                body["metadata"]["resourceVersion"] = existing.metadata.resource_version
+                self.admission_api.replace_mutating_webhook_configuration(name=name, body=body)
+                print(f"  Replaced decoy: {name}")
+
+    def _delete_recorded_webhook(self, ledger: OwnershipLedger, name: str) -> str:
+        """Delete a webhook this run recorded, by UID. Anything else is left in place."""
+        outcome = delete_owned(
+            ledger,
+            _WEBHOOK_KIND,
+            name,
+            lambda body, n=name: self.admission_api.delete_mutating_webhook_configuration(name=n, body=body),
+        )
+        messages = {
+            "deleted": f"  Deleted MutatingWebhookConfiguration: {name}",
+            "absent": f"  MutatingWebhookConfiguration {name} already absent",
+            "foreign": f"  MutatingWebhookConfiguration {name} was replaced by another object; leaving it in place",
+            "not_ours": f"  MutatingWebhookConfiguration {name} was not created by this run; leaving it in place",
+        }
+        print(messages[outcome])
+        return outcome
 
     def _remove_decoy_webhooks(self):
-        """Delete all DECOY_WEBHOOKS. 404s are tolerated (already gone)."""
+        """Delete the DECOY_WEBHOOKS this run created. Absent or foreign ones are left alone."""
         print("[Decoys] Removing decoy MutatingWebhookConfigurations")
+        ledger = self._ownership_ledger()
         for spec in self.DECOY_WEBHOOKS:
+            self._delete_recorded_webhook(ledger, spec["name"])
+
+    def _wait_for_namespace_gone(self, name: str, timeout_s: int = 120) -> None:
+        """Poll until the namespace is gone; a namespace still terminating after the timeout is reported, not fatal."""
+        deadline = time.monotonic() + timeout_s
+        while True:
             try:
-                self.admission_api.delete_mutating_webhook_configuration(name=spec["name"])
-                print(f"  Deleted decoy: {spec['name']}")
+                self.core_api.read_namespace(name=name)
             except ApiException as e:
                 if e.status == 404:
-                    print(f"  Decoy {spec['name']} already absent")
-                else:
-                    raise
+                    return
+                raise
+            if time.monotonic() >= deadline:
+                print(f"  Namespace {name} is still terminating after {timeout_s}s; continuing")
+                return
+            time.sleep(2)
 
     def _patch_target_deployment_resources(self):
         """Patch the target Deployment's first container with explicit memory
@@ -700,27 +728,21 @@ spec:
         self._install_decoy_webhooks()
 
         webhook = self._build_webhook_body()
+        ledger = self._ownership_ledger()
         try:
-            self.admission_api.create_mutating_webhook_configuration(body=webhook)
+            created = self.admission_api.create_mutating_webhook_configuration(body=webhook)
+            ledger.record(_WEBHOOK_KIND, self.WEBHOOK_NAME, uid_of_object(created), owner=type(self).__name__)
             print(f"Created MutatingWebhookConfiguration: {self.WEBHOOK_NAME}")
         except ApiException as e:
-            if e.status == 409:
-                # Replacing an existing object of this name is only safe when it is this
-                # harness's own leftover. The name is Gatekeeper's canonical one, so a real
-                # Gatekeeper install would land here, and recovery deletes this object.
-                existing = self.admission_api.read_mutating_webhook_configuration(name=self.WEBHOOK_NAME)
-                existing_labels = ((existing.metadata.labels or {}) if existing.metadata else {}) or {}
-                if existing_labels.get("sregym.io/owned") != "true":
-                    raise RuntimeError(
-                        f"MutatingWebhookConfiguration {self.WEBHOOK_NAME!r} already exists and was not created "
-                        f"by SREGym (labels: {existing_labels or '{}'}). This scenario deletes that object when it "
-                        "recovers, so it will not replace one it does not own."
-                    ) from e
-                print(f"MutatingWebhookConfiguration {self.WEBHOOK_NAME} is this harness's own leftover; replacing")
-                webhook["metadata"]["resourceVersion"] = existing.metadata.resource_version
-                self.admission_api.replace_mutating_webhook_configuration(name=self.WEBHOOK_NAME, body=webhook)
-            else:
+            if e.status != 409:
                 raise
+            # The name is Gatekeeper's canonical one, so a real Gatekeeper install would land here,
+            # and recovery deletes this object. Replace it only when the ledger records this UID.
+            existing = self.admission_api.read_mutating_webhook_configuration(name=self.WEBHOOK_NAME)
+            ledger.require_owned(_WEBHOOK_KIND, self.WEBHOOK_NAME, uid_of_object(existing), action="replace")
+            print(f"MutatingWebhookConfiguration {self.WEBHOOK_NAME} is this run's own leftover; replacing")
+            webhook["metadata"]["resourceVersion"] = existing.metadata.resource_version
+            self.admission_api.replace_mutating_webhook_configuration(name=self.WEBHOOK_NAME, body=webhook)
 
         time.sleep(8)
 
@@ -746,22 +768,23 @@ spec:
     @mark_fault_injected
     def recover_fault(self):
         print("== Fault Recovery ==")
-        try:
-            self.admission_api.delete_mutating_webhook_configuration(name=self.WEBHOOK_NAME)
-            print(f"Deleted MutatingWebhookConfiguration: {self.WEBHOOK_NAME}")
-        except ApiException as e:
-            if e.status == 404:
-                print(f"MutatingWebhookConfiguration {self.WEBHOOK_NAME} already absent")
-            else:
-                raise
+        ledger = self._ownership_ledger()
+        self._delete_recorded_webhook(ledger, self.WEBHOOK_NAME)
 
         self._remove_decoy_webhooks()
 
-        subprocess.run(
-            ["kubectl", "delete", "namespace", self.BACKEND_SVC_NAMESPACE, "--ignore-not-found"],
-            check=False,
-            text=True,
+        namespace = self.BACKEND_SVC_NAMESPACE
+        outcome = delete_owned(
+            ledger,
+            _NAMESPACE_KIND,
+            namespace,
+            lambda body, n=namespace: self.core_api.delete_namespace(name=n, body=body),
         )
+        if outcome == "deleted":
+            print(f"Deleted namespace: {namespace}")
+            self._wait_for_namespace_gone(namespace)
+        else:
+            print(f"Namespace {namespace} ({outcome}); leaving it in place")
 
         self._run(
             [

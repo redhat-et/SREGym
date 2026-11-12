@@ -2,17 +2,20 @@
 
 Two properties matter more than the mechanics:
 
-- the teardown never deletes an object it does not own, which is what the ownership label buys;
+- the teardown never deletes an object it does not own: the infrastructure label and Helm release,
+  or the run's ownership ledger matched by UID;
 - the verdict tolerates exactly what the teardown reported, so a run cannot excuse a removal it
   did not make.
 """
 
+import json
 import logging
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from sregym.conductor.conductor import Conductor
 from sregym.service.damage_report import CLEAN, DAMAGED, OWNED
+from sregym.service.ownership_ledger import OwnershipLedger
 
 
 def _conductor():
@@ -25,10 +28,39 @@ def _conductor():
     return conductor
 
 
+def _cluster(*, kinds: dict[str, list[tuple[str, str]]] | None = None):
+    """A kubectl whose listings return (name, uid) objects, and which removes what it is asked to delete.
+
+    `kinds` maps a kind (`clusterrole`, `namespace`, ...) to its (name, uid) objects. Deletes are
+    recorded in `.deleted` and drop the object from later listings, as the API server would.
+    """
+    state = {kind: list(objects) for kind, objects in (kinds or {}).items()}
+    deleted: list[str] = []
+
+    def run(command: str, timeout=None) -> str:
+        parts = command.split()
+        if parts[:2] == ["kubectl", "delete"]:
+            kind, name = parts[2], parts[3]
+            deleted.append(f"{kind} {name}")
+            state[kind] = [(n, uid) for n, uid in state.get(kind, []) if n != name]
+            return ""
+        if parts[:2] == ["kubectl", "get"] and parts[-1] == "json":
+            kind = parts[2]
+            items = [{"metadata": {"name": n, "uid": uid}} for n, uid in state.get(kind, [])]
+            return json.dumps({"items": items})
+        return json.dumps({"items": []})
+
+    kubectl = MagicMock()
+    kubectl.exec_command_checked.side_effect = run
+    kubectl.deleted = deleted
+    return kubectl
+
+
 def test_teardown_calls_both_releases_and_removes_the_owned_namespaces(monkeypatch):
     conductor = _conductor()
     monkeypatch.setattr(
-        "sregym.conductor.conductor.delete_owned_cluster_scoped", lambda kubectl, log: ["clusterrole/mcp-server"]
+        "sregym.conductor.conductor.delete_owned_cluster_scoped",
+        lambda kubectl, log, ledger=None: ["clusterrole/mcp-server"],
     )
     conductor.kubectl.exec_command_checked.return_value = '{"items": []}'
 
@@ -47,7 +79,7 @@ def test_teardown_calls_both_releases_and_removes_the_owned_namespaces(monkeypat
 def test_a_failing_release_teardown_does_not_stop_the_rest(monkeypatch):
     conductor = _conductor()
     conductor.prometheus.teardown.side_effect = RuntimeError("release not found")
-    monkeypatch.setattr("sregym.conductor.conductor.delete_owned_cluster_scoped", lambda kubectl, log: [])
+    monkeypatch.setattr("sregym.conductor.conductor.delete_owned_cluster_scoped", lambda kubectl, log, ledger=None: [])
     conductor.kubectl.exec_command_checked.return_value = '{"items": []}'
 
     removed = conductor.teardown_observers()
@@ -58,7 +90,7 @@ def test_a_failing_release_teardown_does_not_stop_the_rest(monkeypatch):
 
 def test_a_surviving_volume_is_reported_not_finalizer_patched(monkeypatch, caplog):
     conductor = _conductor()
-    monkeypatch.setattr("sregym.conductor.conductor.delete_owned_cluster_scoped", lambda kubectl, log: [])
+    monkeypatch.setattr("sregym.conductor.conductor.delete_owned_cluster_scoped", lambda kubectl, log, ledger=None: [])
     conductor.kubectl.exec_command_checked.return_value = (
         '{"items": [{"metadata": {"name": "pvc-abc"}, "spec": {"claimRef": {"namespace": "observe"}}},'
         ' {"metadata": {"name": "pvc-platform"}, "spec": {"claimRef": {"namespace": "openshift-monitoring"}}}]}'
@@ -181,14 +213,14 @@ def test_what_helm_uninstalled_is_reported_as_removed_by_us(monkeypatch):
         "mutatingwebhookconfiguration": [],
     }
 
-    def fake_owned_names(kubectl, kind, log=None):
+    def fake_owned_names(kubectl, kind, log=None, ledger=None):
         # After the Helm uninstalls have run, nothing owned is left.
         return list(owned_now[kind]) if not kubectl.helm_uninstalls_ran else []
 
     monkeypatch.setattr("sregym.conductor.conductor.owned_names", fake_owned_names)
     monkeypatch.setattr(
         "sregym.conductor.conductor.delete_owned_cluster_scoped",
-        lambda kubectl, log: ["clusterrole/mcp-server", "clusterrolebinding/mcp-server"],
+        lambda kubectl, log, ledger=None: ["clusterrole/mcp-server", "clusterrolebinding/mcp-server"],
     )
     conductor.kubectl.exec_command_checked.return_value = '{"items": []}'
     conductor.kubectl.helm_uninstalls_ran = False
@@ -203,3 +235,77 @@ def test_what_helm_uninstalled_is_reported_as_removed_by_us(monkeypatch):
     assert "clusterrole/prometheus-server" in removed, "the Helm-removed role must be reported"
     assert "clusterrole/mcp-server" in removed
     assert "clusterrolebinding/mcp-server" in removed
+
+
+def test_a_ledger_owned_scenario_namespace_is_removed_and_reported():
+    """`platform-ops` carries no label, so the ledger's UID match is the only thing that removes it."""
+    conductor = _conductor()
+    ledger = OwnershipLedger()
+    ledger.record("namespace", "platform-ops", "uid-ops")
+    conductor.ownership_ledger = ledger
+    kubectl = _cluster(kinds={"namespace": [("platform-ops", "uid-ops")]})
+    conductor.kubectl = kubectl
+
+    removed = conductor.teardown_observers()
+
+    assert "namespace/platform-ops" in removed
+    assert "namespace platform-ops" in kubectl.deleted
+    assert ledger.uid_of("namespace", "platform-ops") is None
+
+
+def test_a_namespace_with_the_same_name_and_another_uid_is_never_deleted():
+    conductor = _conductor()
+    ledger = OwnershipLedger()
+    ledger.record("namespace", "platform-ops", "uid-ops")
+    conductor.ownership_ledger = ledger
+    kubectl = _cluster(kinds={"namespace": [("platform-ops", "uid-platform")]})
+    conductor.kubectl = kubectl
+
+    removed = conductor.teardown_observers()
+
+    assert "namespace/platform-ops" not in removed
+    assert "namespace platform-ops" not in kubectl.deleted
+
+
+def test_a_ledger_owned_clusterrole_is_deleted_by_uid_and_forgotten():
+    conductor = _conductor()
+    ledger = OwnershipLedger()
+    ledger.record("clusterrole", "configmap-cleanup-controller", "uid-cr")
+    conductor.ownership_ledger = ledger
+    kubectl = _cluster(kinds={"clusterrole": [("configmap-cleanup-controller", "uid-cr")]})
+    conductor.kubectl = kubectl
+
+    removed = conductor.teardown_observers()
+
+    assert removed.count("clusterrole/configmap-cleanup-controller") == 1
+    assert "clusterrole configmap-cleanup-controller" in kubectl.deleted
+    assert ledger.uid_of("clusterrole", "configmap-cleanup-controller") is None
+
+
+def test_the_old_ownership_label_alone_deletes_nothing_without_a_ledger_entry():
+    conductor = _conductor()
+    conductor.ownership_ledger = OwnershipLedger()
+    kubectl = MagicMock()
+    kubectl.exec_command_checked.side_effect = lambda command, timeout=None: (
+        json.dumps(
+            {
+                "items": [
+                    {
+                        "metadata": {
+                            "name": "configmap-cleanup-controller",
+                            "uid": "uid-cr",
+                            "labels": {"sregym.io/owned": "true"},
+                        }
+                    }
+                ]
+            }
+        )
+        if "get clusterrole " in command
+        else json.dumps({"items": []})
+    )
+    conductor.kubectl = kubectl
+
+    removed = conductor.teardown_observers()
+
+    assert not any("clusterrole" in item for item in removed)
+    assert not any("delete clusterrole" in str(call.args[0]) for call in kubectl.exec_command_checked.call_args_list)

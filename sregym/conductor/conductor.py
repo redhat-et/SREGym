@@ -70,7 +70,14 @@ from sregym.service.internet_policy import InternetPolicy
 from sregym.service.k8s_proxy import KubernetesAPIProxy
 from sregym.service.kubectl import WAIT_FOR_POD_READY_TIMEOUT, KubeCtl
 from sregym.service.mcp_server import MCPServer
-from sregym.service.owned_objects import OWNED_CLUSTER_SCOPED_KINDS, delete_owned_cluster_scoped, owned_names
+from sregym.service.owned_objects import (
+    OWNED_CLUSTER_SCOPED_KINDS,
+    delete_ledger_namespaces,
+    delete_owned_cluster_scoped,
+    ledger_namespaces_present,
+    owned_names,
+)
+from sregym.service.ownership_ledger import OwnershipLedger
 from sregym.service.rollout import deployment_rollout_complete
 from sregym.service.telemetry.loki import Loki
 from sregym.service.telemetry.prometheus import Prometheus
@@ -176,6 +183,8 @@ class Conductor:
 
         self.cluster_state = ClusterStateManager(self.kubectl)
         self.cluster_egress = ClusterEgressBoundary(self.kubectl)
+        # The run's record of the scenario-created objects it made, matched by UID at teardown.
+        self.ownership_ledger = OwnershipLedger()
         self._baseline_captured = False
         # False once the persisted baseline is refused for describing a cluster that
         # no longer exists: reconcile then has nothing trustworthy to aim at.
@@ -384,7 +393,7 @@ class Conductor:
         StorageClasses, plus a privileged node-disk-manager DaemonSet. On a managed
         cluster the privileged pods are refused, so the run dies *after* those
         cluster-scoped objects exist, and nothing here removes them -- the teardown
-        removes what carries this harness's ownership label, and they carry none.
+        removes only harness infrastructure and objects its ledger recorded, and these are neither.
         That is a leftover on somebody else's cluster, so a forgotten --storage-class
         is a refusal rather than a deploy.
 
@@ -464,6 +473,13 @@ class Conductor:
         self.logger.error(f"[DEPLOY] {message}")
         raise RuntimeError(message)
 
+    def _ownership_ledger(self) -> OwnershipLedger:
+        """Return this run's ownership ledger, or a file-backed one for a conductor built without it.
+
+        Tests build a conductor with `__new__` and never run `__init__`, so the attribute may be absent.
+        """
+        return getattr(self, "ownership_ledger", None) or OwnershipLedger()
+
     def teardown_observers(self) -> list[str]:
         """Remove the observer stack and everything SREGym created outside its namespaces.
 
@@ -471,20 +487,23 @@ class Conductor:
         `observe/prometheus-server`, and a result may be re-evaluated after its problem ended.
 
         Three things survive a namespaced cleanup and are removed here: the Helm releases, the
-        release PVCs Helm retains on purpose, and the cluster-scoped objects the charts and the
-        MCP manifest create. The last group is deleted by ownership label
-        (`sregym.service.owned_objects`), not by name, so a same-named object belonging to the
-        platform is never touched.
+        release PVCs Helm retains on purpose, and the objects SREGym created outside its namespaces.
+        The cluster-scoped ones are matched by ownership (`sregym.service.owned_objects`): the
+        infrastructure label, the Helm release annotations, or the run's ownership ledger by UID.
+        The scenario namespaces (`platform-ops`) are removed through the ledger alone. A same-named
+        object the run did not create is never touched.
 
         Returns the objects it removed, which is what the damage verdict is given as its only
         tolerance: the verdict can excuse what this method reports and nothing else.
         """
+        ledger = self._ownership_ledger()
         removed: list[str] = []
         # `helm uninstall` removes the chart's ClusterRoles and Bindings without telling anyone,
         # so they are recorded before it runs: every owned name that is gone afterwards was
         # removed by this teardown, and the damage verdict must tolerate exactly that.
         owned_before = {
-            kind: set(owned_names(self.kubectl, kind, log=self.logger)) for kind in OWNED_CLUSTER_SCOPED_KINDS
+            kind: set(owned_names(self.kubectl, kind, log=self.logger, ledger=ledger))
+            for kind in OWNED_CLUSTER_SCOPED_KINDS
         }
         for component in (getattr(self, "prometheus", None), getattr(self, "loki", None)):
             teardown = getattr(component, "teardown", None)
@@ -494,9 +513,9 @@ class Conductor:
                 teardown()
             except Exception as exc:
                 self.logger.warning(f"[TEARDOWN] {type(component).__name__} teardown failed: {exc}")
-        removed.extend(delete_owned_cluster_scoped(self.kubectl, log=self.logger))
+        removed.extend(delete_owned_cluster_scoped(self.kubectl, log=self.logger, ledger=ledger))
         for kind, names in owned_before.items():
-            still_there = set(owned_names(self.kubectl, kind, log=self.logger))
+            still_there = set(owned_names(self.kubectl, kind, log=self.logger, ledger=ledger))
             removed.extend(f"{kind}/{name}" for name in sorted(names - still_there))
 
         for namespace in self._observer_namespaces():
@@ -508,12 +527,15 @@ class Conductor:
                 continue
             removed.append(f"namespace/{namespace}")
 
+        removed.extend(delete_ledger_namespaces(self.kubectl, ledger, log=self.logger))
+
         for volume in self._report_surviving_volumes():
             self.logger.warning(
                 f"[TEARDOWN] PersistentVolume {volume} is still present after teardown; "
                 "remove it by hand once its claim is gone"
             )
-        return removed
+        # A deleted object is reported by the delete and again by the before/after comparison.
+        return list(dict.fromkeys(removed))
 
     def _observer_namespaces(self) -> list[str]:
         """Return the namespaces the observer stack and the MCP server own, deduplicated."""
@@ -575,23 +597,26 @@ class Conductor:
         return report
 
     def _objects_left_behind(self) -> list[str]:
-        """Return what this harness still owns on the cluster, by label, after a teardown.
+        """Return what this harness still owns on the cluster after a teardown.
 
-        Ownership is read from the objects themselves -- the label this harness sets and the
-        Helm release names it deploys -- never from a list of names it expects to have made, so
+        Ownership is read from the objects themselves -- the infrastructure label and the Helm
+        release annotations -- or, for scenario-created objects, from the run's ownership ledger
+        matched by UID. Nothing is read from a list of names the harness expects to have made, so
         a same-named object belonging to someone else is not reported here. A read that fails is
         a warning and an empty answer: the caller is a verdict, and inventing survivors from an
         unreadable API would be as wrong as hiding them.
         """
+        ledger = self._ownership_ledger()
         left: list[str] = []
         for kind in OWNED_CLUSTER_SCOPED_KINDS:
-            left.extend(f"{kind}/{name}" for name in owned_names(self.kubectl, kind, log=self.logger))
+            left.extend(f"{kind}/{name}" for name in owned_names(self.kubectl, kind, log=self.logger, ledger=ledger))
         for namespace in self._observer_namespaces():
             try:
                 self.kubectl.exec_command_checked(f"kubectl get namespace {self._q(namespace)} -o name", timeout=30)
             except Exception:
                 continue
             left.append(f"namespace/{namespace}")
+        left.extend(f"namespace/{name}" for name in ledger_namespaces_present(self.kubectl, ledger, log=self.logger))
         left.extend(f"persistentvolume/{name}" for name in self._report_surviving_volumes())
         return sorted(set(left))
 
@@ -1835,6 +1860,12 @@ class Conductor:
                 "IPPool/IPAMConfig reset, the Calico route-reflector label drift cleanup, and the CoreDNS NXDOMAIN "
                 "template recovery. They repair components a managed cluster does not run."
             )
+            # SREGym can only delete Failed pods in a namespace it owns: a cluster-wide
+            # delete would reach other tenants' and platform namespaces.
+            self.kubectl.exec_command(
+                f"kubectl delete pods -n {self.current_problem.namespace} "
+                "--field-selector=status.phase=Failed --ignore-not-found=true"
+            )
         else:
             self.logger.info("[FIX] Imbalance leftover if any")
 
@@ -1847,6 +1878,17 @@ class Conductor:
 
             self.logger.info("[FIX] KubeletEvictionThresholdMisconfig leftover if any")
             injector.recover_disk_pressure_all()
+            # Delete Failed pods left by the eviction loop. Skip the app namespace
+            # because undeploy_app() tears down the application namespace anyway.
+            from sregym.conductor.problems.kubelet_eviction_threshold_misconfig import (
+                KubeletEvictionThresholdMisconfig,
+            )
+
+            self.kubectl.exec_command(
+                f"kubectl delete pods --all-namespaces "
+                f"--field-selector=status.phase=Failed,metadata.namespace!={KubeletEvictionThresholdMisconfig.NAMESPACE} "
+                "--ignore-not-found=true"
+            )
 
             self.logger.info("[FIX] Calico IPPool/strictAffinity leftover if any")
             try:
@@ -1860,12 +1902,6 @@ class Conductor:
                     '-p \'{"spec":{"disabled":false}}\''
                 )
                 kubectl.exec_command(
-            # SREGym can only delete Failed pods in a namespace it owns: a cluster-wide
-            # delete would reach other tenants' and platform namespaces.
-            self.kubectl.exec_command(
-                f"kubectl delete pods -n {self.current_problem.namespace} "
-                "--field-selector=status.phase=Failed --ignore-not-found=true"
-            )
                     'kubectl patch ipamconfig default --type=merge -p \'{"spec":{"strictAffinity":false}}\''
                 )
                 kubectl.exec_command(
@@ -1878,17 +1914,6 @@ class Conductor:
                 self.logger.warning(f"Could not fix Calico IPPool state: {e}")
 
             self._fix_calico_route_reflector_label_drift()
-            # Delete Failed pods left by the eviction loop. Skip the app namespace
-            # because undeploy_app() tears down the application namespace anyway.
-            from sregym.conductor.problems.kubelet_eviction_threshold_misconfig import (
-                KubeletEvictionThresholdMisconfig,
-            )
-
-            self.kubectl.exec_command(
-                f"kubectl delete pods --all-namespaces "
-                f"--field-selector=status.phase=Failed,metadata.namespace!={KubeletEvictionThresholdMisconfig.NAMESPACE} "
-                "--ignore-not-found=true"
-            )
 
             self.logger.info("[FIX] Stale CoreDNS NXDOMAIN templates if any")
             injector = VirtualizationFaultInjector(namespace="kube-system")

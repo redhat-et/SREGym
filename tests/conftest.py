@@ -15,6 +15,14 @@ import logging
 
 import pytest
 
+import sregym.paths
+
+
+@pytest.fixture(autouse=True)
+def _ownership_ledger_in_tmp(monkeypatch, tmp_path):
+    """Point every test's ownership ledger at its own tmp file, never the developer's cache dir."""
+    monkeypatch.setattr(sregym.paths, "OWNERSHIP_LEDGER_FILE", tmp_path / "owned_objects.json", raising=False)
+
 
 @pytest.fixture(autouse=True)
 def _logs_reach_caplog(caplog):

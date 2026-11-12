@@ -13,7 +13,7 @@ from sregym.cluster_platform import is_openshift
 from sregym.paths import MCP_SERVER_K8S
 from sregym.service.kubectl import WAIT_FOR_POD_READY_TIMEOUT, KubeCtl
 from sregym.service.kubernetes_access_policy import restricted_cluster_role
-from sregym.service.owned_objects import label_owned
+from sregym.service.owned_objects import label_infrastructure
 from sregym.service.pod_scheduling import without_node_pins
 from sregym.service.rollout import deployment_rollout_complete
 
@@ -66,9 +66,9 @@ class MCPServer:
             # The Deployment pins the control-plane node, which on a managed cluster
             # is tainted and not SREGym's to schedule onto.
             resources = without_node_pins(resources)
-        # Mark every object as this harness's, so the teardown removes it by ownership rather
+        # Label every object as harness infrastructure, so the teardown removes it by label rather
         # than by a name list that needs maintaining. See sregym.service.owned_objects.
-        resources = label_owned(resources)
+        resources = label_infrastructure(resources)
         for index, body in enumerate(resources):
             if body["kind"] == "ClusterRole" and self.restrict_network_access:
                 resources[index] = restricted_cluster_role(body)

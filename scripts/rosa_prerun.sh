@@ -156,7 +156,7 @@ EOF
       plan "oc delete clusterrolebinding sregym-promtail-hostmount-anyuid --ignore-not-found"
       oc delete clusterrolebinding sregym-promtail-hostmount-anyuid --ignore-not-found >/dev/null 2>&1 \
         || failed "could not prune sregym-promtail-hostmount-anyuid"
-      echo "  the binding is not labelled sregym.io/owned on purpose: it is the operator's standing grant,"
+      echo "  the binding is not labelled as harness infrastructure on purpose: it is the operator's standing grant,"
       echo "  so a teardown does not remove it. It is also a durable escalation path — any pod that can use"
       echo "  the observe/promtail service account may be privileged cluster-wide. Undo with:"
       echo "    oc delete clusterrolebinding sregym-promtail-privileged"
@@ -250,11 +250,38 @@ else
   ok "no application or observer namespace is left over"
 fi
 
-if owned="$(oc get clusterrole,clusterrolebinding -l sregym.io/owned=true -o name 2>/dev/null)" && [ -n "$owned" ]; then
-  note "cluster-scoped objects marked sregym.io/owned exist: $(echo "$owned" | tr '\n' ' ')"
-  echo "  the next run's teardown collects them; oc delete clusterrole,clusterrolebinding -l sregym.io/owned=true removes them now"
+if infra="$(oc get clusterrole,clusterrolebinding -l app.kubernetes.io/instance=observability-stack -o name 2>/dev/null)" && [ -n "$infra" ]; then
+  note "cluster-scoped harness infrastructure exists before the run: $(echo "$infra" | tr '\n' ' ')"
+  echo "  the run reuses or replaces these by label; delete them by hand only if no run is using them"
 else
-  ok "no cluster-scoped object is marked sregym.io/owned"
+  ok "no cluster-scoped harness infrastructure is left over"
+fi
+
+# Legacy: an earlier harness version labelled its objects sregym.io/owned. The harness no longer reads that
+# label, so these are reported and never collected.
+if legacy="$(oc get clusterrole,clusterrolebinding -l sregym.io/owned=true -o name 2>/dev/null)" && [ -n "$legacy" ]; then
+  note "legacy: cluster-scoped objects labelled sregym.io/owned from an earlier harness version exist: $(echo "$legacy" | tr '\n' ' ')"
+  echo "  the harness no longer collects them; oc delete clusterrole,clusterrolebinding -l sregym.io/owned=true removes them by hand"
+else
+  ok "no legacy sregym.io/owned object is left over"
+fi
+
+# Fixed names the scenarios create. Read-only: the harness records what it creates in its own ledger and
+# refuses to adopt or replace an object the ledger did not record, so a leftover here stops that scenario.
+fixed=""
+if oc get ns platform-ops >/dev/null 2>&1; then fixed="$fixed namespace/platform-ops"; fi
+for webhook in gatekeeper-mutating-webhook-configuration cert-manager-webhook istio-sidecar-injector \
+  kyverno-resource-mutating-webhook-cfg linkerd-proxy-injector-webhook-config; do
+  if oc get mutatingwebhookconfiguration "$webhook" >/dev/null 2>&1; then fixed="$fixed mutatingwebhookconfiguration/$webhook"; fi
+done
+for kind in clusterrole clusterrolebinding; do
+  if oc get "$kind" configmap-cleanup-controller >/dev/null 2>&1; then fixed="$fixed $kind/configmap-cleanup-controller"; fi
+done
+if [ -n "$fixed" ]; then
+  note "these exist before the run:$fixed"
+  echo "  the harness will refuse rather than adopt an object its ledger did not record; remove it by hand if it is a leftover."
+else
+  ok "none of the fixed names the scenarios create is already on the cluster"
 fi
 
 # ------------------------------------------------------------------------------------------------ 6. next

@@ -140,3 +140,41 @@ def test_the_checks_a_run_needs_are_reported_not_assumed():
 def test_the_next_command_carries_the_flags_an_openshift_run_requires():
     for flag in ("--suite sregym-lite", "--platform openshift", "--internet-access open", "--teardown-observers"):
         assert flag in TEXT
+
+
+def test_the_harness_infrastructure_is_scanned_by_its_neutral_label():
+    assert "-l app.kubernetes.io/instance=observability-stack" in TEXT
+
+
+def test_the_sregym_owned_label_survives_only_as_a_legacy_scan():
+    """`sregym.io/owned` is no longer an ownership marker. Every line naming it must sit in the legacy scan,
+    and that scan only reports, so it never deletes."""
+    legacy_start = TEXT.index("# Legacy: an earlier harness version")
+    legacy_end = TEXT.index("# Fixed names the scenarios create.")
+    legacy_block = TEXT[legacy_start:legacy_end]
+    assert "sregym.io/owned" in legacy_block
+    assert TEXT.count("sregym.io/owned") == legacy_block.count("sregym.io/owned")
+    assert "not labelled as harness infrastructure on purpose" in TEXT
+    assert "not labelled sregym.io/owned on purpose" not in TEXT
+
+
+def test_the_fixed_names_the_scenarios_create_are_checked_read_only():
+    for name in (
+        "platform-ops",
+        "gatekeeper-mutating-webhook-configuration",
+        "cert-manager-webhook",
+        "istio-sidecar-injector",
+        "kyverno-resource-mutating-webhook-cfg",
+        "linkerd-proxy-injector-webhook-config",
+        "configmap-cleanup-controller",
+    ):
+        assert name in TEXT, name
+    fixed_start = TEXT.index("# Fixed names the scenarios create.")
+    fixed_end = TEXT.index(
+        "# ------------------------------------------------------------------------------------------------ 6. next"
+    )
+    fixed_block = TEXT[fixed_start:fixed_end]
+    assert "oc get " in fixed_block
+    for verb in ("delete", "apply", "patch", "create", "label"):
+        assert f"oc {verb}" not in fixed_block, verb
+    assert "refuse rather than adopt" in TEXT

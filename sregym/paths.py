@@ -15,6 +15,9 @@ LLM_CACHE_FILE = CACHE_DIR / "llm_cache.json"
 # Cluster baseline state snapshot (captured from a fresh cluster)
 CLUSTER_BASELINE_STATE_FILE = CACHE_DIR / "cluster_baseline_state.json"
 
+# Ledger of the cluster-scoped and namespace objects this run created (kind, name, UID)
+OWNERSHIP_LEDGER_FILE = Path(os.environ.get("SREGYM_OWNERSHIP_LEDGER", CACHE_DIR / "owned_objects.json"))
+
 # Fault scripts
 FAULT_SCRIPTS = BASE_DIR / "generators" / "fault" / "script"
 

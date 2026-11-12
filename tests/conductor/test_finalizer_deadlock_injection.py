@@ -11,11 +11,14 @@ from types import SimpleNamespace
 from unittest import mock
 
 import pytest
+from kubernetes.client import ApiClient
+from kubernetes.client.rest import ApiException
 
 from sregym.conductor.problems.finalizer_deadlock_controller import (
     FinalizerDeadlockController,
     _correct_clusterrole_rules,
 )
+from sregym.service.ownership_ledger import ForeignObjectError, OwnershipLedger
 
 _STEPS = (
     "_delete_support_resources",
@@ -129,7 +132,7 @@ def test_recovery_keeps_the_controller_the_oracle_needs():
 
     Removing the support objects in recovery made a recovered fault read as
     `controller_not_healthy`. Only the RBAC is restored; the ClusterRole and its binding are
-    cluster-scoped and owned-labelled, so the teardown collects them.
+    cluster-scoped and recorded in the ownership ledger, so the teardown collects them.
     """
     calls = []
     problem = _problem(calls)
@@ -140,3 +143,123 @@ def test_recovery_keeps_the_controller_the_oracle_needs():
 
     assert calls == ["_restore_clusterrole", "_wait"]
     assert "_delete_support_resources" not in calls
+
+
+def _bare_problem():
+    """A problem whose Kubernetes clients are mocks, so the real create and delete bodies can be inspected."""
+    problem = object.__new__(FinalizerDeadlockController)
+    problem.namespace = "hotel-reservation"
+    problem.configmap_name = "reservation-cleanup-token"
+    problem.controller_name = "cleanup-controller"
+    problem.sa_name = "cleanup-controller"
+    problem.clusterrole_name = "configmap-cleanup-controller"
+    problem.clusterrolebinding_name = "configmap-cleanup-controller"
+    problem.finalizer = "cleanup.reservations.io/pending-cleanup"
+    problem.rbac_v1 = mock.Mock()
+    problem.kubectl = SimpleNamespace(core_v1_api=mock.Mock(), apps_v1_api=mock.Mock())
+    return problem
+
+
+def _obj(uid):
+    return SimpleNamespace(metadata=SimpleNamespace(uid=uid))
+
+
+def _sent_bodies(*mocks):
+    """Every body argument sent to the API by the given mocks, serialised to plain dicts."""
+    bodies = []
+    for api in mocks:
+        for call in api.mock_calls:
+            if "body" in call.kwargs:
+                bodies.append(ApiClient().sanitize_for_serialization(call.kwargs["body"]))
+    return bodies
+
+
+def _labels_and_annotations(node, found):
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key in ("labels", "annotations") and isinstance(value, dict):
+                found.extend(f"{k}={v}" for k, v in value.items())
+            _labels_and_annotations(value, found)
+    elif isinstance(node, list):
+        for item in node:
+            _labels_and_annotations(item, found)
+    return found
+
+
+def test_no_built_object_carries_a_sregym_or_owned_label():
+    problem = _bare_problem()
+    problem.rbac_v1.create_cluster_role.return_value = _obj("uid-cr")
+    problem.rbac_v1.create_cluster_role_binding.return_value = _obj("uid-crb")
+
+    problem._create_service_account()
+    problem._create_clusterrole(_correct_clusterrole_rules())
+    problem._create_clusterrolebinding()
+    problem._create_controller_script()
+    problem._deploy_controller()
+    problem._create_finalized_configmap()
+    problem._replace_clusterrole(_correct_clusterrole_rules())
+
+    bodies = _sent_bodies(problem.rbac_v1, problem.kubectl.core_v1_api, problem.kubectl.apps_v1_api)
+    assert len(bodies) >= 6, "the test must inspect every object the scenario builds"
+
+    texts = [text for body in bodies for text in _labels_and_annotations(body, [])]
+    assert "app.kubernetes.io/managed-by=cleanup-controller" in texts
+    leaked = [text for text in texts if "sregym" in text.lower() or "owned" in text.lower()]
+    assert leaked == []
+
+
+def test_cluster_scoped_creates_are_recorded_by_uid():
+    problem = _bare_problem()
+    problem.rbac_v1.create_cluster_role.return_value = _obj("uid-cr")
+    problem.rbac_v1.create_cluster_role_binding.return_value = _obj("uid-crb")
+
+    problem._create_clusterrole(_correct_clusterrole_rules())
+    problem._create_clusterrolebinding()
+
+    ledger = OwnershipLedger()
+    assert ledger.uid_of("clusterrole", "configmap-cleanup-controller") == "uid-cr"
+    assert ledger.uid_of("clusterrolebinding", "configmap-cleanup-controller") == "uid-crb"
+
+
+def test_foreign_clusterrole_is_refused_and_never_deleted():
+    problem = _bare_problem()
+    problem.rbac_v1.create_cluster_role.side_effect = ApiException(status=409)
+    problem.rbac_v1.read_cluster_role.return_value = _obj("uid-someone-else")
+
+    with pytest.raises(ForeignObjectError, match="configmap-cleanup-controller"):
+        problem._create_clusterrole(_correct_clusterrole_rules())
+    problem.rbac_v1.replace_cluster_role.assert_not_called()
+
+    problem._force_clear_finalizer = mock.Mock()
+    problem._wait_until_configmap_deleted = mock.Mock()
+    problem._delete_support_resources()
+
+    problem.rbac_v1.delete_cluster_role.assert_not_called()
+    problem.rbac_v1.delete_cluster_role_binding.assert_not_called()
+
+
+def test_foreign_clusterrolebinding_is_refused_and_not_replaced():
+    problem = _bare_problem()
+    problem.rbac_v1.create_cluster_role_binding.side_effect = ApiException(status=409)
+    problem.rbac_v1.read_cluster_role_binding.return_value = _obj("uid-someone-else")
+
+    with pytest.raises(ForeignObjectError, match="configmap-cleanup-controller"):
+        problem._create_clusterrolebinding()
+    problem.rbac_v1.replace_cluster_role_binding.assert_not_called()
+
+
+def test_recorded_cluster_scoped_objects_are_deleted_by_uid():
+    problem = _bare_problem()
+    ledger = OwnershipLedger()
+    ledger.record("clusterrole", "configmap-cleanup-controller", "uid-cr")
+    ledger.record("clusterrolebinding", "configmap-cleanup-controller", "uid-crb")
+
+    problem._force_clear_finalizer = mock.Mock()
+    problem._wait_until_configmap_deleted = mock.Mock()
+    problem._delete_support_resources()
+
+    cr_call = problem.rbac_v1.delete_cluster_role.call_args
+    crb_call = problem.rbac_v1.delete_cluster_role_binding.call_args
+    assert cr_call.kwargs["body"].preconditions.uid == "uid-cr"
+    assert crb_call.kwargs["body"].preconditions.uid == "uid-crb"
+    assert ledger.entries() == [], "a completed delete forgets the entry"
