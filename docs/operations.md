@@ -16,7 +16,7 @@ scripts/rosa_prerun.sh            # apply, then report whether the cluster is re
 DRY_RUN=1 scripts/rosa_prerun.sh  # print every change, make none
 ```
 
-It qualifies the submodule image references, grants `anyuid` to the three application namespaces, creates a
+It qualifies the submodule image references, grants `anyuid` to the three application namespaces and to `observe` and `sregym`, creates a
 cluster-scoped `ClusterRoleBinding` that gives the `observe/promtail` service account the `privileged` SCC,
 and then checks what the run needs and does not change it: the storage class, at least two untainted
 schedulable workers, the Anthropic credentials, and leftovers from an earlier run.
@@ -49,7 +49,7 @@ before it writes anything:
 
 ```bash
 uv run python tests/integration/validate_problem.py --problem network_policy_block --profile full \
-  --platform openshift --storage-class <the cluster default> --internet-access open
+  --platform openshift --storage-class <the cluster default>
 ```
 
 Add `--teardown-observers` to remove the observer stack at the end and have the verdict check, in
@@ -62,7 +62,7 @@ The validator is the cheap end-to-end check: it deploys the observers and the ap
 the fault, runs the oracle, and cleans up. If this fails, the campaign will fail too, and it costs
 minutes instead of a suite.
 
-Three preflights refuse a run before it touches the cluster:
+Four preflights refuse a run before it touches the cluster:
 
 | Preflight | Refuses when | Where |
 |---|---|---|
@@ -95,6 +95,11 @@ and `Mitigation.success` sit beside `problem_id`, `attempt` and `run_status`. A 
 `deploy_failed: true` means the application never came up and no stage ran — read the log at that
 timestamp, not the row.
 
+**Each row names the code that produced it.** The provenance columns are `run.git_sha`, `run.git_dirty`
+(tracked files only), `run.submodule_sha`, `run.submodule_dirty`, `run.submodule_diff_sha` and `run.platform`
+(`sregym/run_artifacts.py`, `run_provenance()`; merged into the rows in `main.py`). A result from a dirty
+tree is not a result of the commit named in `run.git_sha`.
+
 **The phase ledger is the timeline.** `phases_attempt<N>.jsonl` records what happened when, which is
 what turns "the run took 412 s" into "the run spent 212 s here". It also records the `internet_access`
 mode, because a result from an `open` run is not comparable with one from a `filtered` run and the
@@ -116,7 +121,7 @@ reported as a pass.
 
 1. **The validator passed** with the profile the campaign uses — including `--with-loki` if the
    campaign deploys Loki, since that is a different manifest set, a different SCC requirement and
-   roughly 12 GiB more storage.
+   10 GiB more storage (`_LOKI_GIB` in `sregym/service/capacity_preflight.py`).
 2. **The agent run finished**: `run_status` is `complete`, not `incomplete` and not `deploy_failed`.
    `incomplete` names its reason in `incomplete_reason`, and that reason is the finding.
 3. **The damage verdict is clean**: no pre-existing object was removed and no measured object
@@ -184,7 +189,11 @@ block storage — 8 GiB Prometheus, 2 GiB Alertmanager, 10 GiB Loki and 1 GiB pe
 That number, not the pod count, is what a sweep runs out of first, which is why the capacity
 preflight checks storage.
 
-Observers are **not** torn down by default: an iterate-fast loop reuses them. Pass
+Observers are **not** torn down by default: an iterate-fast loop reuses them. On OpenShift with reconcile
+off, the observers are reset after every scenario instead, so each scenario pays one observer deploy
+(`sregym/conductor/conductor.py`, `_reset_observers`). The reset starts the `observe` namespace deletion
+without waiting for it; the next scenario's deploy waits for `observe` to finish terminating, and a failed
+reset is logged as a warning rather than stopping the campaign. Pass
 `--teardown-observers` to remove the stack at the end of a campaign — the Helm releases, the
 volumes Helm retains on purpose (the Prometheus one is 8 GiB), and the cluster-scoped objects this
 harness created, which are found by the infrastructure label or the Helm release, and by ledger UID, and never by name. Reuse is safe only while
