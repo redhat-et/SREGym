@@ -240,8 +240,17 @@ def _write(path: Path, found: dict[tuple[str, str], LedgerEntry]) -> None:
 
 
 def _quarantine(path: Path) -> None:
-    """Move an unreadable ledger aside so a fresh one can be written without losing the evidence."""
-    target = path.with_name(path.name + _CORRUPT_SUFFIX)
+    """Move an unreadable ledger aside so a fresh one can be written without losing the evidence.
+
+    The target name carries a UTC timestamp, and a counter if that name is taken, so an earlier
+    quarantined file is never overwritten.
+    """
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    target = path.with_name(f"{path.name}{_CORRUPT_SUFFIX}.{stamp}")
+    counter = 0
+    while target.exists():
+        counter += 1
+        target = path.with_name(f"{path.name}{_CORRUPT_SUFFIX}.{stamp}.{counter}")
     try:
         os.replace(path, target)
         logger.warning("Moved the unreadable ownership ledger to %s", target)

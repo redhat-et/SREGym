@@ -9,7 +9,7 @@ from sregym.cluster_platform import is_openshift
 from sregym.paths import BASE_DIR, PROMETHEUS_METADATA
 from sregym.profile import is_svelte
 from sregym.service.helm import Helm
-from sregym.service.kubectl import KubeCtl
+from sregym.service.kubectl import WAIT_FOR_POD_READY_TIMEOUT, KubeCtl
 from sregym.service.rollout import deployment_rollout_complete
 from sregym.service.telemetry.release_pvcs import delete_retained_pvcs, use_main_release_handling
 from sregym.storage import get_storage_class, uses_openebs
@@ -78,7 +78,8 @@ class Prometheus:
             self.logger.info("Prometheus runs the requested values. Skipping redeployment.")
             return
 
-        # Wait for namespace to be fully terminated before attempting fresh install
+        # Wait for namespace to be fully terminated before attempting fresh install. On OpenShift the
+        # namespace is still terminating here after the observer reset, which does not wait itself.
         self._wait_for_namespace_termination()
 
         Helm.uninstall(**self.helm_configs)
@@ -180,7 +181,12 @@ class Prometheus:
             self._delete_retained_pvcs()
 
     def _wait_for_namespace_termination(self):
-        """Wait for namespace to be fully deleted if it's currently in Terminating state."""
+        """Wait for namespace to be fully deleted if it's currently in Terminating state.
+
+        On OpenShift the bound is WAIT_FOR_POD_READY_TIMEOUT, because the observer reset deletes
+        `observe` without waiting. Kind keeps its 300 s bound. A namespace still Terminating after
+        the bound raises RuntimeError, which fails this scenario's deploy and not the cleanup drain.
+        """
         result = subprocess.run(
             f"kubectl get namespace {self.namespace} -o jsonpath='{{.status.phase}}' 2>/dev/null",
             shell=True,
@@ -188,8 +194,15 @@ class Prometheus:
             text=True,
         )
         if result.stdout.strip() == "Terminating":
+            max_wait = WAIT_FOR_POD_READY_TIMEOUT if is_openshift() else 300
             self.logger.info(f"Namespace '{self.namespace}' is terminating, waiting for full deletion...")
-            KubeCtl().wait_for_namespace_deletion(self.namespace)
+            try:
+                KubeCtl().wait_for_namespace_deletion(self.namespace, max_wait=max_wait)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Namespace '{self.namespace}' is still Terminating after {max_wait}s; "
+                    "the observer stack cannot be redeployed until it is gone"
+                ) from exc
 
     def _is_prometheus_running(self) -> bool:
         """Require a current server rollout as well as Ready release pods."""

@@ -1,7 +1,8 @@
-"""The API proxy hides the platform's own namespaces, and refuses to start blind.
+"""The API proxy hides the platform's own openshift* namespaces, and refuses to start blind.
 
-A managed cluster's namespaces are not the harness's business, and they are not
-knowable ahead of time, so they are read from the cluster. An unreadable list is
+A managed cluster's openshift* namespaces are not the harness's business, and they
+are not knowable ahead of time, so they are read from the cluster. kube-* namespaces
+are left visible. An unreadable list is
 an error: starting the proxy with an unknown hidden set would show the agent
 namespaces it was never meant to see.
 """
@@ -17,9 +18,11 @@ from sregym.cluster_platform import KIND, OPENSHIFT
 from sregym.conductor.conductor import Conductor
 from sregym.service.k8s_proxy import HIDDEN_NAMESPACES
 
-PLATFORM_NAMESPACES = ["openshift-monitoring", "openshift-dns", "kube-system", "kube-public"]
+PLATFORM_NAMESPACES = ["openshift-monitoring", "openshift-dns"]
+# kube-system and kube-public are not hidden: only openshift* is.
+KUBE_NAMESPACES = ["kube-system", "kube-public"]
 APPLICATION_NAMESPACE = "astronomy-shop"
-HIDING_LOG = f"[PROXY] Hiding {len(PLATFORM_NAMESPACES)} openshift*/kube-* namespaces from the agent"
+HIDING_LOG = f"[PROXY] Hiding {len(PLATFORM_NAMESPACES)} openshift* namespaces from the agent"
 
 
 @pytest.fixture(autouse=True)
@@ -53,7 +56,7 @@ def _conductor(monkeypatch, platform, namespaces):
 
 
 def test_openshift_hides_the_platform_namespaces_alongside_the_static_ones(monkeypatch, caplog):
-    conductor = _conductor(monkeypatch, OPENSHIFT, [*PLATFORM_NAMESPACES, APPLICATION_NAMESPACE])
+    conductor = _conductor(monkeypatch, OPENSHIFT, [*PLATFORM_NAMESPACES, *KUBE_NAMESPACES, APPLICATION_NAMESPACE])
     # The proxy copies the attribute into closure locals in start(), so only the set
     # visible at that moment is what the running proxy hides.
     hidden_at_start = []
@@ -64,6 +67,7 @@ def test_openshift_hides_the_platform_namespaces_alongside_the_static_ones(monke
 
     assert hidden_at_start == [set(HIDDEN_NAMESPACES) | set(PLATFORM_NAMESPACES)]
     assert APPLICATION_NAMESPACE not in hidden_at_start[0]
+    assert not set(KUBE_NAMESPACES) & hidden_at_start[0]
     conductor.k8s_proxy.start.assert_called_once_with()
     assert HIDING_LOG in [record.getMessage() for record in caplog.records]
 

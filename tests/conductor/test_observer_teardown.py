@@ -13,9 +13,19 @@ import logging
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+from kubernetes.client.rest import ApiException
+
 from sregym.conductor.conductor import Conductor
+from sregym.service import owned_objects
 from sregym.service.damage_report import CLEAN, DAMAGED, OWNED
 from sregym.service.ownership_ledger import OwnershipLedger
+
+
+@pytest.fixture(autouse=True)
+def typed_clients(monkeypatch):
+    """Every typed client is the fake cluster's API of the kubectl under test, never a real one."""
+    monkeypatch.setattr(owned_objects, "_typed_api", lambda kubectl, api_name: kubectl.cluster.api)
 
 
 def _conductor():
@@ -31,19 +41,41 @@ def _conductor():
 def _cluster(*, kinds: dict[str, list[tuple[str, str]]] | None = None):
     """A kubectl whose listings return (name, uid) objects, and which removes what it is asked to delete.
 
-    `kinds` maps a kind (`clusterrole`, `namespace`, ...) to its (name, uid) objects. Deletes are
-    recorded in `.deleted` and drop the object from later listings, as the API server would.
+    `kinds` maps a kind (`clusterrole`, `namespace`, ...) to its (name, uid) objects. Typed deletes
+    carry a UID precondition: one that no longer matches the live object answers 409, as the API
+    server does. A delete removes the object from later listings. Each typed call is recorded in
+    `.cluster.calls` as (kind, name, precondition uid), and `.deleted` keeps the `kind name` form.
     """
     state = {kind: list(objects) for kind, objects in (kinds or {}).items()}
     deleted: list[str] = []
+    calls: list[tuple[str, str, str | None]] = []
+
+    def delete(kind: str, name: str, body) -> None:
+        uid = body.preconditions.uid if body.preconditions is not None else None
+        calls.append((kind, name, uid))
+        live = [(n, u) for n, u in state.get(kind, []) if n == name]
+        if not live:
+            raise ApiException(status=404)
+        if uid is not None and live[0][1] != uid:
+            raise ApiException(status=409)
+        deleted.append(f"{kind} {name}")
+        state[kind] = [(n, u) for n, u in state.get(kind, []) if n != name]
+
+    class _Api:
+        def delete_namespace(self, name, body):
+            delete("namespace", name, body)
+
+        def delete_cluster_role(self, name, body):
+            delete("clusterrole", name, body)
+
+        def delete_cluster_role_binding(self, name, body):
+            delete("clusterrolebinding", name, body)
+
+        def delete_mutating_webhook_configuration(self, name, body):
+            delete("mutatingwebhookconfiguration", name, body)
 
     def run(command: str, timeout=None) -> str:
         parts = command.split()
-        if parts[:2] == ["kubectl", "delete"]:
-            kind, name = parts[2], parts[3]
-            deleted.append(f"{kind} {name}")
-            state[kind] = [(n, uid) for n, uid in state.get(kind, []) if n != name]
-            return ""
         if parts[:2] == ["kubectl", "get"] and parts[-1] == "json":
             kind = parts[2]
             items = [{"metadata": {"name": n, "uid": uid}} for n, uid in state.get(kind, [])]
@@ -53,6 +85,7 @@ def _cluster(*, kinds: dict[str, list[tuple[str, str]]] | None = None):
     kubectl = MagicMock()
     kubectl.exec_command_checked.side_effect = run
     kubectl.deleted = deleted
+    kubectl.cluster = SimpleNamespace(api=_Api(), calls=calls)
     return kubectl
 
 
@@ -249,7 +282,7 @@ def test_a_ledger_owned_scenario_namespace_is_removed_and_reported():
     removed = conductor.teardown_observers()
 
     assert "namespace/platform-ops" in removed
-    assert "namespace platform-ops" in kubectl.deleted
+    assert kubectl.cluster.calls == [("namespace", "platform-ops", "uid-ops")]
     assert ledger.uid_of("namespace", "platform-ops") is None
 
 
@@ -278,7 +311,7 @@ def test_a_ledger_owned_clusterrole_is_deleted_by_uid_and_forgotten():
     removed = conductor.teardown_observers()
 
     assert removed.count("clusterrole/configmap-cleanup-controller") == 1
-    assert "clusterrole configmap-cleanup-controller" in kubectl.deleted
+    assert kubectl.cluster.calls == [("clusterrole", "configmap-cleanup-controller", "uid-cr")]
     assert ledger.uid_of("clusterrole", "configmap-cleanup-controller") is None
 
 

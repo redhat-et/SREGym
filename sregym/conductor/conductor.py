@@ -73,6 +73,7 @@ from sregym.service.mcp_server import MCPServer
 from sregym.service.owned_objects import (
     OWNED_CLUSTER_SCOPED_KINDS,
     delete_ledger_namespaces,
+    delete_ledger_objects,
     delete_owned_cluster_scoped,
     ledger_namespaces_present,
     owned_names,
@@ -327,23 +328,21 @@ class Conductor:
             items = self.kubectl.list_namespaces().items
         except Exception as exc:
             raise RuntimeError(
-                f"Could not read the cluster's namespaces ({exc!r}), so the openshift*/kube-* namespaces cannot be "
+                f"Could not read the cluster's namespaces ({exc!r}), so the openshift* namespaces cannot be "
                 "hidden from the agent. The proxy will not start with an unknown hidden set."
             ) from exc
         if not items:
             raise RuntimeError(
-                "Could not read a single namespace from the cluster, so the openshift*/kube-* namespaces cannot be "
+                "Could not read a single namespace from the cluster, so the openshift* namespaces cannot be "
                 "hidden from the agent. The proxy will not start with an unknown hidden set."
             )
         platform_namespaces = {
             item.metadata.name
             for item in items
-            if item.metadata
-            and item.metadata.name
-            and (item.metadata.name.startswith("openshift") or item.metadata.name.startswith("kube-"))
+            if item.metadata and item.metadata.name and item.metadata.name.startswith("openshift")
         }
         self.k8s_proxy.hidden_namespaces = set(self.k8s_proxy.hidden_namespaces) | platform_namespaces
-        self.logger.info(f"[PROXY] Hiding {len(platform_namespaces)} openshift*/kube-* namespaces from the agent")
+        self.logger.info(f"[PROXY] Hiding {len(platform_namespaces)} openshift* namespaces from the agent")
 
     def stop_k8s_proxy(self):
         """Stop the Kubernetes API proxy."""
@@ -536,6 +535,34 @@ class Conductor:
             )
         # A deleted object is reported by the delete and again by the before/after comparison.
         return list(dict.fromkeys(removed))
+
+    def _reset_observers(self) -> None:
+        """Remove the observer stack after a scenario, so the next one deploys it fresh.
+
+        OpenShift, with Loki deployed by this run, only (see `_cleanup_sync`). `deploy_app()`
+        redeploys the stack for every scenario, so this costs one redeploy per scenario and keeps
+        one scenario's telemetry, retained volumes and Helm state out of the next. Each component's
+        own teardown runs first: Prometheus deletes its retained claim, and Loki uninstalls Promtail
+        with its release. The namespace delete then takes what is left in `observe`, which holds
+        the observer pods. It does not wait: a slow volume release must not spend the cleanup
+        drain budget. The next `deploy_app()` waits for `observe` to finish terminating before it
+        installs Prometheus (see `Prometheus.deploy`).
+
+        The `sregym` namespace and the MCP server are not touched. Only `prometheus.namespace` is
+        deleted, and it is `observe`. `teardown_observers()` is the end-of-campaign path and is not
+        this method. A failure here propagates to the caller, which logs it as a warning.
+        """
+        for component in (self.prometheus, self.loki):
+            try:
+                component.teardown()
+            except Exception as exc:
+                self.logger.warning(f"[RESET] {type(component).__name__} teardown failed: {exc}")
+        namespace = self.prometheus.namespace
+        self.logger.info(f"[RESET] Removing observer namespace {namespace}")
+        self.kubectl.exec_command_checked(
+            f"kubectl delete namespace {self._q(namespace)} --ignore-not-found --wait=false",
+            timeout=WAIT_FOR_POD_READY_TIMEOUT,
+        )
 
     def _observer_namespaces(self) -> list[str]:
         """Return the namespaces the observer stack and the MCP server own, deduplicated."""
@@ -1049,6 +1076,17 @@ class Conductor:
         if stop_late_cleanup():
             return
 
+        # OpenShift: collect what this run's ledger recorded and the recovery above left on the
+        # cluster, by UID. Kind keeps its main behaviour, which has no ledger.
+        if is_openshift():
+            try:
+                removed = delete_ledger_objects(self.kubectl, self._ownership_ledger(), log=self.logger)
+                if removed:
+                    self.logger.info(f"[CLEANUP] Removed ledger-recorded objects: {removed}")
+            except Exception as e:
+                self.logger.exception("[CLEANUP] Failed to remove ledger-recorded objects")
+                cleanup_errors.append(f"ledger_cleanup: {type(e).__name__}: {e}")
+
         # Reconcile cluster state to baseline
         if self._baseline_captured:
             try:
@@ -1076,6 +1114,18 @@ class Conductor:
             except Exception as e:
                 self.logger.exception("[CLEANUP] Failed to reconcile cluster state")
                 cleanup_errors.append(f"cluster_reconcile: {type(e).__name__}: {e}")
+
+        # OpenShift keeps the observer stack between scenarios unless it is reset here. Only with
+        # reconcile off, the mode in which the baseline is kept for reporting and not reconciled
+        # against, and only when this run deploys Loki. The reset runs after the reconcile, so
+        # reconcile never sees a stack that was just removed. A failed reset is not a cleanup
+        # error: the next deploy waits for `observe` and redeploys it, so the campaign goes on.
+        if is_openshift() and self.reconcile == RECONCILE_OFF and self.config.deploy_loki:
+            try:
+                self._reset_observers()
+                self.logger.info("[CLEANUP] Observer stack reset")
+            except Exception as e:
+                self.logger.warning(f"[CLEANUP] Observer stack reset failed, the next deploy will redeploy it: {e}")
 
         if stop_late_cleanup():
             return

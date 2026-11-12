@@ -16,13 +16,20 @@ managed platform. Three groups of objects need removing:
   each one by name and UID at creation time, and an object is ours only when its live UID matches.
 
 An object that matches none of these is never touched, so a cluster where a platform component
-happens to share a name is not at risk. Deletion is by ownership, not by name.
+happens to share a name is not at risk. Deletion is by ownership, not by name: every delete is a
+typed Kubernetes API call that carries a UID precondition, so the API server refuses it when the
+object at that name has been replaced since it was listed.
 """
 
 import json
 import logging
 
-from sregym.service.ownership_ledger import OwnershipLedger
+from kubernetes import client
+from kubernetes.client import V1DeleteOptions, V1Preconditions
+from kubernetes.client.rest import ApiException
+
+from sregym.service.ownership_ledger import KINDS as LEDGER_KINDS
+from sregym.service.ownership_ledger import OwnershipLedger, delete_owned
 
 logger = logging.getLogger("all.sregym.owned_objects")
 
@@ -42,6 +49,14 @@ HELM_NAMESPACE = "observe"
 # them. A crashed run would otherwise leave webhooks that intercept every matching write on the
 # cluster with nothing to collect them, so they are recorded in the ledger and removed by UID.
 OWNED_CLUSTER_SCOPED_KINDS = ("clusterrole", "clusterrolebinding", "mutatingwebhookconfiguration")
+
+# The typed client class and the delete method that removes one object of each kind by name.
+_TYPED_DELETE = {
+    "namespace": ("CoreV1Api", "delete_namespace"),
+    "clusterrole": ("RbacAuthorizationV1Api", "delete_cluster_role"),
+    "clusterrolebinding": ("RbacAuthorizationV1Api", "delete_cluster_role_binding"),
+    "mutatingwebhookconfiguration": ("AdmissionregistrationV1Api", "delete_mutating_webhook_configuration"),
+}
 
 
 def label_infrastructure(resources: list[dict]) -> list[dict]:
@@ -105,12 +120,81 @@ def _list_items(kubectl, kind: str, log) -> list[dict] | None:
         return None
 
 
+def _named(items: list[dict]) -> list[tuple[str, dict]]:
+    """Return (name, metadata) for each listed item that has a name; an item without one is skipped."""
+    named = []
+    for item in items:
+        metadata = item.get("metadata") if isinstance(item, dict) else None
+        if not isinstance(metadata, dict):
+            continue
+        name = metadata.get("name")
+        if isinstance(name, str) and name:
+            named.append((name, metadata))
+    return named
+
+
 def _owned_in(items: list[dict], kind: str, ledger: OwnershipLedger | None) -> list[str]:
-    return sorted(item["metadata"]["name"] for item in items if is_owned(item.get("metadata"), kind, ledger))
+    return sorted(name for name, metadata in _named(items) if is_owned(metadata, kind, ledger))
 
 
 def _foreign_in(items: list[dict], kind: str, ledger: OwnershipLedger | None) -> list[str]:
-    return sorted(item["metadata"]["name"] for item in items if not is_owned(item.get("metadata"), kind, ledger))
+    return sorted(name for name, metadata in _named(items) if not is_owned(metadata, kind, ledger))
+
+
+def _typed_api(kubectl, api_name: str):
+    """Return the typed client `api_name`, on the same ApiClient KubeCtl uses.
+
+    `CoreV1Api` is KubeCtl's own `core_v1_api`. The others are built from that ApiClient, so they
+    share its kubeconfig, credentials and TLS settings.
+    """
+    if api_name == "CoreV1Api":
+        return kubectl.core_v1_api
+    return getattr(client, api_name)(kubectl.core_v1_api.api_client)
+
+
+def _deleter(kubectl, kind: str, name: str):
+    """Return `delete(body=...)`, the typed call that deletes `kind/name` with the body it is given."""
+    api_name, method = _TYPED_DELETE[kind]
+    delete = getattr(_typed_api(kubectl, api_name), method)
+    return lambda body: delete(name=name, body=body)
+
+
+def _delete_by_uid(kubectl, kind: str, name: str, uid: str) -> str:
+    """Delete `kind/name` only while it still has `uid`, and return "deleted", "absent" or "foreign"."""
+    body = V1DeleteOptions(preconditions=V1Preconditions(uid=uid))
+    try:
+        _deleter(kubectl, kind, name)(body=body)
+    except ApiException as exc:
+        if exc.status == 404:
+            return "absent"
+        if exc.status == 409:
+            return "foreign"
+        raise
+    return "deleted"
+
+
+def _delete_listed(kubectl, kind: str, name: str, uid: str | None, ledger: OwnershipLedger | None, log, tag) -> bool:
+    """Delete `kind/name` as listed with `uid`, and return whether this call removed it.
+
+    An object the ledger recorded goes through `delete_owned`, which also forgets its entry. An
+    object owned by its label has no ledger entry, so it is deleted with the listed UID as the
+    precondition. Either way a same-named object that replaced it is refused by the API server.
+    A failed delete is logged and returns False, so its ledger entry is kept for the next try.
+    """
+    if not uid:
+        log.warning("%s Not deleting %s/%s: the listing gave no UID to check it against", tag, kind, name)
+        return False
+    try:
+        if ledger is not None and ledger.owns(kind, name, uid):
+            outcome = delete_owned(ledger, kind, name, _deleter(kubectl, kind, name))
+        else:
+            outcome = _delete_by_uid(kubectl, kind, name, uid)
+    except Exception as exc:
+        log.warning("%s Could not delete %s/%s: %s", tag, kind, name, exc)
+        return False
+    if outcome == "foreign":
+        log.warning("%s Not deleting %s/%s: it was replaced after it was listed, so it is not ours", tag, kind, name)
+    return outcome == "deleted"
 
 
 def owned_names(kubectl, kind: str, log=None, ledger: OwnershipLedger | None = None) -> list[str]:
@@ -137,11 +221,12 @@ def foreign_names(kubectl, kind: str, ledger: OwnershipLedger | None = None) -> 
 def delete_owned_cluster_scoped(kubectl, log=None, ledger: OwnershipLedger | None = None) -> list[str]:
     """Delete every cluster-scoped object SREGym owns, whatever its age, and return their names.
 
-    Each deletion is logged, and a same-named object SREGym does not own is left alone and
-    counted in a line per kind, so an operator can see that something exists which the harness
-    deliberately did not remove. A deleted object's ledger entry is forgotten. A kind whose
-    listing succeeds has its ledger entries for objects no longer present forgotten too; a
-    failed listing prunes nothing.
+    Every delete carries a UID precondition set to the UID listed for that object, so an object
+    replaced after the listing is refused and left alone. Each deletion is logged, and a
+    same-named object SREGym does not own is left alone and counted in a line per kind, so an
+    operator can see that something exists which the harness deliberately did not remove. A
+    deleted object's ledger entry is forgotten. A kind whose listing succeeds has its ledger
+    entries for objects no longer present forgotten too; a failed listing prunes nothing.
     """
     log = log if log is not None else logger
     removed: list[str] = []
@@ -149,18 +234,13 @@ def delete_owned_cluster_scoped(kubectl, log=None, ledger: OwnershipLedger | Non
         items = _list_items(kubectl, kind, log)
         if items is None:
             continue
+        live = dict(_named(items))
         for name in _owned_in(items, kind, ledger):
             log.info("[TEARDOWN] Deleting %s/%s, owned by this harness", kind, name)
-            try:
-                kubectl.exec_command_checked(f"kubectl delete {kind} {name} --ignore-not-found", timeout=120)
-            except Exception as exc:
-                log.warning("[TEARDOWN] Could not delete %s/%s: %s", kind, name, exc)
-                continue
-            removed.append(f"{kind}/{name}")
-            if ledger is not None:
-                ledger.forget(kind, name)
+            if _delete_listed(kubectl, kind, name, live[name].get("uid"), ledger, log, "[TEARDOWN]"):
+                removed.append(f"{kind}/{name}")
         if ledger is not None:
-            present = {item["metadata"]["name"] for item in items if item.get("metadata")}
+            present = set(live)
             for entry in ledger.entries(kind):
                 if entry.name not in present:
                     ledger.forget(kind, entry.name)
@@ -184,34 +264,65 @@ def ledger_namespaces_present(kubectl, ledger: OwnershipLedger, log=None) -> lis
 def delete_ledger_namespaces(kubectl, ledger: OwnershipLedger, log=None) -> list[str]:
     """Delete each namespace the ledger recorded with a matching UID, and return their names.
 
-    A ledger entry for a namespace absent from a successful listing is forgotten. A failed
-    deletion keeps its entry, so the next teardown tries again.
+    Each delete carries the recorded UID as a precondition. A namespace replaced after the listing
+    is refused by the API server (409) and its entry forgotten. A ledger entry for a namespace absent
+    from a successful listing is forgotten. A failed deletion keeps its entry, so the next teardown
+    tries again.
     """
     log = log if log is not None else logger
     items = _list_items(kubectl, "namespace", log)
     if items is None:
         return []
     removed: list[str] = []
+    live = dict(_named(items))
     for name in _ledger_namespaces_in(items, ledger):
         log.info("[TEARDOWN] Deleting namespace/%s, created by this run", name)
-        try:
-            kubectl.exec_command_checked(f"kubectl delete namespace {name} --ignore-not-found", timeout=120)
-        except Exception as exc:
-            log.warning("[TEARDOWN] Could not delete namespace/%s: %s", name, exc)
-            continue
-        ledger.forget("namespace", name)
-        removed.append(f"namespace/{name}")
-    present = {item["metadata"]["name"] for item in items if item.get("metadata")}
+        if _delete_listed(kubectl, "namespace", name, live[name].get("uid"), ledger, log, "[TEARDOWN]"):
+            removed.append(f"namespace/{name}")
+    present = set(live)
     for entry in ledger.entries("namespace"):
         if entry.name not in present:
             ledger.forget("namespace", entry.name)
     return removed
 
 
+def delete_ledger_objects(kubectl, ledger: OwnershipLedger, log=None) -> list[str]:
+    """Delete every ledger-recorded object still on the cluster under its recorded UID, and return their names.
+
+    Covers every kind the ledger records, so a scenario object its own recovery did not remove
+    (a webhook, a ClusterRole or binding, `platform-ops`) is still collected here. An object is
+    deleted only when its live UID equals the recorded one, and the delete itself carries that UID
+    as a precondition, so an object replaced between the listing and the delete is refused by the
+    API server (409) and left in place. An object that carries the infrastructure or Helm label is
+    never deleted, whatever the ledger says. An entry whose object is gone, or whose name now holds
+    a different UID, or whose delete was refused as foreign, is forgotten; any other failed deletion
+    keeps its entry for the next try.
+    """
+    log = log if log is not None else logger
+    removed: list[str] = []
+    for kind in LEDGER_KINDS:
+        entries = ledger.entries(kind)
+        if not entries:
+            continue
+        items = _list_items(kubectl, kind, log)
+        if items is None:
+            continue
+        live = dict(_named(items))
+        for entry in entries:
+            metadata = live.get(entry.name)
+            if metadata is None or not ledger.owns(kind, entry.name, metadata.get("uid")):
+                ledger.forget(kind, entry.name)
+                continue
+            if is_owned(metadata):
+                log.warning(
+                    "[CLEANUP] Not deleting %s/%s: it carries the harness infrastructure label", kind, entry.name
+                )
+                continue
+            log.info("[CLEANUP] Deleting %s/%s, recorded by this run", kind, entry.name)
+            if _delete_listed(kubectl, kind, entry.name, metadata.get("uid"), ledger, log, "[CLEANUP]"):
+                removed.append(f"{kind}/{entry.name}")
+    return removed
+
+
 def _ledger_namespaces_in(items: list[dict], ledger: OwnershipLedger) -> list[str]:
-    owned = []
-    for item in items:
-        metadata = item.get("metadata") or {}
-        if ledger.owns("namespace", metadata.get("name"), metadata.get("uid")):
-            owned.append(metadata["name"])
-    return sorted(owned)
+    return sorted(name for name, metadata in _named(items) if ledger.owns("namespace", name, metadata.get("uid")))

@@ -106,8 +106,23 @@ def test_corrupt_file_reads_as_empty_and_is_moved_aside_on_write(tmp_path, caplo
 
     ledger.record("namespace", "platform-ops", "uid-1")
 
-    assert (tmp_path / "owned_objects.json.corrupt").read_text() == "{not json"
+    [moved] = list(tmp_path.glob("owned_objects.json.corrupt.*"))
+    assert moved.read_text() == "{not json"
     assert OwnershipLedger(path).uid_of("namespace", "platform-ops") == "uid-1"
+
+
+def test_a_second_corrupt_ledger_does_not_overwrite_the_first(tmp_path):
+    path = tmp_path / "owned_objects.json"
+    ledger = OwnershipLedger(path)
+
+    path.write_text("{first corruption")
+    ledger.record("namespace", "platform-ops", "uid-1")
+    path.write_text("{second corruption")
+    ledger.record("namespace", "platform-ops", "uid-2")
+
+    moved = sorted(p.read_text() for p in tmp_path.glob("owned_objects.json.corrupt*"))
+    assert moved == ["{first corruption", "{second corruption"]
+    assert OwnershipLedger(path).uid_of("namespace", "platform-ops") == "uid-2"
 
 
 def test_wrong_shape_reads_as_empty(tmp_path):
