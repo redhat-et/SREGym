@@ -96,21 +96,9 @@ def test_verify_refuses_openshift_declared_on_a_cluster_that_is_not_openshift():
         cluster_platform.verify_platform_matches_cluster(lambda: False)
 
 
-def test_verify_allows_an_unconfirmed_openshift_only_for_local_debugging(monkeypatch):
-    # TEMPORARY_ESCAPE_HATCH — this test goes with the constant it exercises.
-    monkeypatch.setenv("SREGYM_ALLOW_UNVERIFIED_PLATFORM", "1")
-    cluster_platform.set_platform(OPENSHIFT)
-    log = RecordingLogger()
-
-    assert cluster_platform.verify_platform_matches_cluster(lambda: False, log=log) == OPENSHIFT
-    warning = " ".join(log.warnings)
-    assert "NOT an OpenShift run" in warning
-    assert "must never be reported as an OpenShift result" in warning
-
-
-@pytest.mark.parametrize("value", ["0", "false", "False", "no", "off", "", "2"])
-def test_the_escape_hatch_needs_an_explicit_enable(monkeypatch, value):
-    # TEMPORARY_ESCAPE_HATCH — anything but an explicit enable keeps refusing.
+@pytest.mark.parametrize("value", ["1", "true", "yes", "0", ""])
+def test_no_environment_variable_overrides_the_openshift_refusal(monkeypatch, value):
+    # The override was removed: no value of the old variable lifts the refusal.
     monkeypatch.setenv("SREGYM_ALLOW_UNVERIFIED_PLATFORM", value)
     cluster_platform.set_platform(OPENSHIFT)
 

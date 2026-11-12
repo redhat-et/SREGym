@@ -6,13 +6,12 @@
 #
 # What it does, in order (every step is idempotent, so re-running is safe):
 #
-#   1. Preflight. Login answers, the cluster is OpenShift, SREGYM_ALLOW_UNVERIFIED_PLATFORM is unset,
-#      no other harness process is running.
+#   1. Preflight. Login answers, the cluster is OpenShift, no other harness process is running.
 #   2. Qualify the unqualified image references in the SREGym-applications submodule
 #      (scripts/qualify_submodule_images.py --apply; undo with --revert). Without it every Hotel
 #      Reservation scenario is refused by the image preflight.
-#   3. Grant the anyuid SCC to the three SREGym Lite application namespaces, in group form so the grant
-#      outlives the per-scenario namespace.
+#   3. Grant the anyuid SCC to the three SREGym Lite application namespaces and to observe and sregym,
+#      which the harness preflight reviews, in group form so the grant outlives the per-scenario namespace.
 #   4. Grant the `privileged` SCC to Promtail's service account in `observe`, through a cluster-scoped
 #      ClusterRoleBinding so it survives the namespace being deleted at teardown. Measured on ROSA 4.22.18:
 #      without a grant every promtail pod is refused; with `hostmount-anyuid` it is admitted and cannot
@@ -42,6 +41,8 @@ STORAGE_CLASS="${STORAGE_CLASS:-gp3}"
 PROMTAIL_SCC="${PROMTAIL_SCC:-privileged}"
 DRY_RUN="${DRY_RUN:-0}"
 APP_NAMESPACES="social-network hotel-reservation astronomy-shop"
+# The anyuid grant also covers the namespaces the harness preflight reviews (observe, sregym).
+ANYUID_NAMESPACES="$APP_NAMESPACES observe sregym"
 
 problems=0
 failures=0
@@ -79,12 +80,6 @@ else
   exit 1
 fi
 
-if [ -n "${SREGYM_ALLOW_UNVERIFIED_PLATFORM:-}" ]; then
-  missing "SREGYM_ALLOW_UNVERIFIED_PLATFORM is set in this shell; unset it before a managed cluster run, or a misdirected --platform openshift only warns"
-else
-  ok "SREGYM_ALLOW_UNVERIFIED_PLATFORM is unset"
-fi
-
 if pgrep -f "main.py --suite|main.py --problem" >/dev/null 2>&1; then
   missing "a harness process is already running; two of them collide on one cluster"
 else
@@ -108,9 +103,9 @@ fi
 
 # --------------------------------------------------------------- 3. SREGym Lite application admission grants
 
-step "Grant anyuid to the SREGym Lite application namespaces"
+step "Grant anyuid to the SREGym Lite application namespaces and the harness namespaces"
 echo "  group form, so the grant outlives the per-scenario namespace"
-for ns in $APP_NAMESPACES; do
+for ns in $ANYUID_NAMESPACES; do
   run oc adm policy add-scc-to-group anyuid "system:serviceaccounts:$ns" || failed "anyuid grant for $ns"
 done
 
@@ -288,11 +283,10 @@ fi
 
 step "SREGym Lite: what to run next"
 cat <<EOF
-  One process per scenario, so a failed deploy cannot abort the rest. 16 of the 17 Lite scenarios run;
+  One process for the whole suite: a platform refusal stops the campaign at the first problem, and each scenario runs in its own deployment. 16 of the 17 Lite scenarios run;
   service_dns_resolution_failure_social_network is skipped by name because it writes kube-system/coredns.
 
     cd $(cd "$(dirname "$0")/.." && pwd)
-    unset SREGYM_ALLOW_UNVERIFIED_PLATFORM
     mkdir -p logs
     SREGYM_CACHE_DIR=logs/rosa-sregym-lite-cache-\$(date -u +%H%M) uv run main.py --suite sregym-lite \\
       --agent claudecode --model claude-haiku-5-5 --judge-model anthropic/claude-opus-5-5 \\

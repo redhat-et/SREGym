@@ -7,6 +7,7 @@ cluster. The harness grants no permission at all; this script is the operator's,
 the two apart.
 """
 
+import os
 import shutil
 import subprocess
 
@@ -75,9 +76,7 @@ def test_it_deletes_only_its_own_stale_binding():
 def test_the_undo_command_is_printed_not_run():
     """The script adds and reports; removing the operator's own standing binding is the operator's act."""
     assert "oc delete clusterrolebinding sregym-promtail-privileged" in TEXT
-    assert not any(
-        "sregym-promtail-privileged" in line and line.startswith("oc delete") for line in executed_lines()
-    )
+    assert not any("sregym-promtail-privileged" in line and line.startswith("oc delete") for line in executed_lines())
 
 
 def test_it_never_asks_for_elevated_privileges():
@@ -128,7 +127,6 @@ def test_promtails_grant_survives_the_namespace_it_names():
 
 def test_the_checks_a_run_needs_are_reported_not_assumed():
     for check in (
-        "SREGYM_ALLOW_UNVERIFIED_PLATFORM",
         "ANTHROPIC_API_KEY",
         "storageclass",
         "Worker capacity",
@@ -178,3 +176,21 @@ def test_the_fixed_names_the_scenarios_create_are_checked_read_only():
     for verb in ("delete", "apply", "patch", "create", "label"):
         assert f"oc {verb}" not in fixed_block, verb
     assert "refuse rather than adopt" in TEXT
+
+
+def test_a_dry_run_prints_the_anyuid_grants_for_observe_and_sregym(tmp_path):
+    """The harness preflight reviews observe and sregym as well as the application namespaces, so the
+    operator's anyuid grant names them too. A stub oc records every call: a dry run may print a grant, never make one."""
+    calls = tmp_path / "oc-calls"
+    stub = tmp_path / "oc"
+    stub.write_text(f'#!/usr/bin/env bash\necho "$*" >> "{calls}"\necho stub\n')
+    stub.chmod(0o755)
+    env = {"PATH": f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}", "DRY_RUN": "1", "HOME": str(tmp_path)}
+
+    result = subprocess.run(["bash", str(SCRIPT)], capture_output=True, text=True, env=env, timeout=120)
+
+    assert result.returncode in (0, 2), result.stderr
+    for namespace in ("observe", "sregym", "social-network", "hotel-reservation", "astronomy-shop"):
+        assert f"+ oc adm policy add-scc-to-group anyuid system:serviceaccounts:{namespace}" in result.stdout
+    recorded = calls.read_text().splitlines() if calls.exists() else []
+    assert not [line for line in recorded if line.startswith(("adm ", "apply ", "delete "))], recorded

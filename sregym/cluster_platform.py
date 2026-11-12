@@ -25,20 +25,6 @@ PLATFORMS = (KIND, OPENSHIFT)
 
 _ENV_VAR = "SREGYM_PLATFORM"
 
-# TEMPORARY_ESCAPE_HATCH — delete this constant, its use in
-# verify_platform_matches_cluster and its test before this branch is proposed
-# upstream. It exists for one reason: nobody has a managed OpenShift cluster on
-# their desk, so the OpenShift code paths can only be exercised end to end on a
-# local kind cluster, declared as OpenShift. A run started this way is NOT an
-# OpenShift run, and its result must never be reported as one. Grep for the
-# marker when the sandbox work is over.
-#
-# Only an explicit enable lifts the refusal: the value must be one of
-# _ALLOW_UNVERIFIED_VALUES after stripping blanks and ignoring case, so
-# SREGYM_ALLOW_UNVERIFIED_PLATFORM=0 (or =false, or an empty value) still refuses.
-_ALLOW_UNVERIFIED_ENV = "SREGYM_ALLOW_UNVERIFIED_PLATFORM"
-_ALLOW_UNVERIFIED_VALUES = frozenset({"1", "true", "yes"})
-
 logger = logging.getLogger("all.sregym.cluster_platform")
 
 _platform: str | None = None
@@ -46,12 +32,6 @@ _platform: str | None = None
 
 class PlatformVerificationError(RuntimeError):
     """The declared platform is not confirmed by the cluster, so the run must not start."""
-
-
-def _unverified_platform_allowed() -> bool:
-    """Return True only for an explicit enable of the temporary escape hatch."""
-    value = os.environ.get(_ALLOW_UNVERIFIED_ENV, "")
-    return value.strip().lower() in _ALLOW_UNVERIFIED_VALUES
 
 
 def set_platform(platform: str) -> None:
@@ -158,10 +138,8 @@ def verify_platform_matches_cluster(discover, *, log=None) -> str:
     OpenShift cluster is refused because the kind code path is destructive on a
     managed cluster; declaring ``openshift`` for a cluster that does not look like
     OpenShift is refused because a result labelled ``openshift`` must come from an
-    OpenShift cluster. ``SREGYM_ALLOW_UNVERIFIED_PLATFORM`` lifts the second
-    refusal for local debugging only; that is temporary, and a run started that way
-    is not an OpenShift run. Only an explicit enable value (``1``, ``true`` or
-    ``yes``) lifts it; ``0`` and ``false`` do not.
+    OpenShift cluster. There is no override: an OpenShift code path cannot be
+    exercised on a cluster that is not OpenShift.
 
     A ``discover`` that raises is treated as unknown and **refuses**: continuing
     with the declared platform after a failed discovery would restore exactly the
@@ -190,20 +168,10 @@ def verify_platform_matches_cluster(discover, *, log=None) -> str:
         )
 
     if platform == OPENSHIFT:
-        if _unverified_platform_allowed():
-            # TEMPORARY_ESCAPE_HATCH — removed with the constant above.
-            log.warning(
-                "API discovery does not report OpenShift, but the platform resolved to 'openshift' and "
-                f"{_ALLOW_UNVERIFIED_ENV} is enabled. Continuing for local debugging only: this run is NOT an "
-                "OpenShift run, it exercises OpenShift code paths on a cluster that is not OpenShift, and its result "
-                "must never be reported as an OpenShift result."
-            )
-            return OPENSHIFT
         raise PlatformVerificationError(
             f"This cluster does not report the OpenShift APIs, but the platform resolved to {platform!r}. "
             "Re-run with --platform kind, or check that kubectl reaches the cluster you meant: a result labelled "
-            "openshift has to come from an OpenShift cluster. "
-            f"(Temporary, for local debugging only: {_ALLOW_UNVERIFIED_ENV}=1 lifts this refusal.)"
+            "openshift has to come from an OpenShift cluster."
         )
 
     log.debug("Platform kind confirmed by API discovery.")
