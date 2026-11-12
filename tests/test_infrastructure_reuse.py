@@ -161,7 +161,7 @@ def test_startup_repairs_ndm_scheduling_only_in_full(startup, monkeypatch, svelt
 def test_healthy_infrastructure_is_not_patched(startup):
     with pytest.raises(ObserverSetupReached):
         startup.deploy_app()
-    startup.kubectl.assert_pod_networking.assert_called_once_with(namespace="kube-system")
+    startup.kubectl.assert_pod_networking.assert_called_once_with()
     startup.kubectl.core_v1_api.patch_namespaced_service.assert_not_called()
     startup.kubectl.apps_v1_api.patch_namespaced_daemon_set.assert_not_called()
     assert startup._metrics_server_configured.call_count == 2

@@ -1860,6 +1860,12 @@ class Conductor:
                     '-p \'{"spec":{"disabled":false}}\''
                 )
                 kubectl.exec_command(
+            # SREGym can only delete Failed pods in a namespace it owns: a cluster-wide
+            # delete would reach other tenants' and platform namespaces.
+            self.kubectl.exec_command(
+                f"kubectl delete pods -n {self.current_problem.namespace} "
+                "--field-selector=status.phase=Failed --ignore-not-found=true"
+            )
                     'kubectl patch ipamconfig default --type=merge -p \'{"spec":{"strictAffinity":false}}\''
                 )
                 kubectl.exec_command(
@@ -1872,6 +1878,17 @@ class Conductor:
                 self.logger.warning(f"Could not fix Calico IPPool state: {e}")
 
             self._fix_calico_route_reflector_label_drift()
+            # Delete Failed pods left by the eviction loop. Skip the app namespace
+            # because undeploy_app() tears down the application namespace anyway.
+            from sregym.conductor.problems.kubelet_eviction_threshold_misconfig import (
+                KubeletEvictionThresholdMisconfig,
+            )
+
+            self.kubectl.exec_command(
+                f"kubectl delete pods --all-namespaces "
+                f"--field-selector=status.phase=Failed,metadata.namespace!={KubeletEvictionThresholdMisconfig.NAMESPACE} "
+                "--ignore-not-found=true"
+            )
 
             self.logger.info("[FIX] Stale CoreDNS NXDOMAIN templates if any")
             injector = VirtualizationFaultInjector(namespace="kube-system")
@@ -1879,15 +1896,6 @@ class Conductor:
                 injector.recover_all_nxdomain_templates()
             except Exception as e:
                 self.logger.error(f"Failed to recover CoreDNS NXDOMAIN templates: {e}")
-
-        # Delete Failed pods left by the eviction loop. SREGym can only delete
-        # Failed pods in a namespace it owns: the previous cluster-wide form
-        # reached other tenants' and platform namespaces, and deleting another
-        # tenant's pods is wrong on any cluster, so this is not platform-gated.
-        self.kubectl.exec_command(
-            f"kubectl delete pods -n {self.current_problem.namespace} "
-            "--field-selector=status.phase=Failed --ignore-not-found=true"
-        )
 
         self.logger.info("[FIX] NightlyRebalanceOOM kube-system actor leftover if any")
         try:
@@ -1920,7 +1928,11 @@ class Conductor:
             # between runs, and deduplicated, since a composite app repeats its first
             # namespace in `namespaces`.
             allow_missing = tuple(sorted(n for n in {problem.namespace, *getattr(problem.app, "namespaces", ())} if n))
-            if self.cluster_state.load_baseline_state(CLUSTER_BASELINE_STATE_FILE, allow_missing=allow_missing):
+            if self.cluster_state.load_baseline_state(
+                CLUSTER_BASELINE_STATE_FILE,
+                allow_missing=allow_missing,
+                check_staleness=is_openshift(),
+            ):
                 self.logger.info("[DEPLOY] Loaded persisted cluster baseline state")
             elif self.cluster_state.baseline_load_status == "stale":
                 # Capture-and-save here would overwrite the only record of the cluster
@@ -1951,7 +1963,7 @@ class Conductor:
             )
             self.kubectl.assert_pod_networking(namespace=problem.namespace)
         else:
-            self.kubectl.assert_pod_networking(namespace="kube-system")
+            self.kubectl.assert_pod_networking()
 
         self._ensure_metrics_api()
 
@@ -2377,24 +2389,16 @@ reclaimPolicy: Delete
         }
 
     def _make_openebs_hostpath_default(self) -> None:
-        """Make `openebs-hostpath` the cluster default, but never take the default from another class.
+        """Make `openebs-hostpath` the cluster default on kind, as `main` does.
 
-        The patch used to run unconditionally, so every deployment took the default away
-        from whatever class the cluster came with. That is a deliberate `kind` behaviour
-        change: a cluster that serves its own default class keeps it.
+        On OpenShift the cluster's own default class is left alone: the run refuses to start
+        unless the class it selected is the default, and this method never changes that.
         """
-        default_classes = self._default_storage_classes()
-        if default_classes and default_classes != {OPENebs}:
-            self.logger.info(
-                "[DEPLOY] Keeping %s as the cluster default; openebs-hostpath is no longer forced to be "
-                "the default (deliberate kind behaviour change)",
-                ", ".join(sorted(default_classes)),
-            )
+        if is_openshift():
+            self.logger.info("[DEPLOY] Not touching the cluster's default storage class on this platform")
             return
-        reason = "it is already the default" if default_classes else "no storage class was the default"
-        self.logger.info("[DEPLOY] Patching StorageClass/%s to be the cluster default because %s", OPENebs, reason)
         self.kubectl.exec_command(
-            f"kubectl patch storageclass {OPENebs} "
+            "kubectl patch storageclass openebs-hostpath "
             '-p \'{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}\''
         )
 

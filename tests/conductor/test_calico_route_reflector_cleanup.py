@@ -260,7 +260,9 @@ def test_fix_kubernetes_keeps_kubelet_eviction_cleanup(monkeypatch):
 
     assert remote_calls == ["recover_kubelet_crash", "recover_disk_pressure_all"]
     assert (
-        "kubectl delete pods -n astronomy-shop --field-selector=status.phase=Failed --ignore-not-found=true"
+        "kubectl delete pods --all-namespaces "
+        "--field-selector=status.phase=Failed,metadata.namespace!=astronomy-shop "
+        "--ignore-not-found=true"
     ) in fake.commands
-    assert not any("--all-namespaces" in command for command in fake.commands)
+    assert not any("-n astronomy-shop --field-selector" in command for command in fake.commands)
     assert calico_cleanup_calls == [True]

@@ -1,6 +1,9 @@
 import json
 import logging
 import subprocess
+from pathlib import Path
+
+import yaml
 
 from sregym.cluster_platform import is_openshift
 from sregym.paths import BASE_DIR, PROMETHEUS_METADATA
@@ -8,7 +11,7 @@ from sregym.profile import is_svelte
 from sregym.service.helm import Helm
 from sregym.service.kubectl import KubeCtl
 from sregym.service.rollout import deployment_rollout_complete
-from sregym.service.telemetry.release_pvcs import delete_retained_pvcs
+from sregym.service.telemetry.release_pvcs import delete_retained_pvcs, use_main_release_handling
 from sregym.storage import get_storage_class, uses_openebs
 
 
@@ -66,6 +69,10 @@ class Prometheus:
 
     def deploy(self):
         """Deploy the metric collector using Helm."""
+        if use_main_release_handling():
+            self._deploy_as_on_main()
+            return
+
         helm_configs = self._requested_helm_configs()
         if self._is_prometheus_running() and Helm.release_matches_requested_values(helm_configs):
             self.logger.info("Prometheus runs the requested values. Skipping redeployment.")
@@ -80,6 +87,61 @@ class Prometheus:
         Helm.install(**helm_configs)
         Helm.record_values_fingerprint(helm_configs)
         Helm.assert_if_deployed(self.namespace)
+
+    def _deploy_as_on_main(self):
+        """The kind deploy, call for call as `main` makes it: no fingerprint."""
+        if self._is_prometheus_running() and self._matches_requested_profile():
+            self.logger.info("Prometheus already uses the requested profile. Skipping redeployment.")
+            return
+
+        # Wait for namespace to be fully terminated before attempting fresh install
+        self._wait_for_namespace_termination()
+
+        Helm.uninstall(**self.helm_configs)
+        self._delete_retained_pvcs()
+
+        helm_configs = dict(self.helm_configs)
+        if is_svelte():
+            svelte_values = BASE_DIR / "observer" / "prometheus" / "values-svelte.yaml"
+            helm_configs["extra_args"] = [*helm_configs.get("extra_args", []), "-f", str(svelte_values)]
+            self.logger.info("[svelte] Dropping Alertmanager and Pushgateway; retention 15d -> 2h")
+
+        Helm.install(**helm_configs)
+        Helm.assert_if_deployed(self.namespace)
+
+    def _matches_requested_profile(self) -> bool:
+        """Compare installed Helm values with the settings controlled by the profile."""
+        result = subprocess.run(
+            [
+                "helm",
+                "get",
+                "values",
+                self.helm_configs["release_name"],
+                "-n",
+                self.namespace,
+                "--all",
+                "-o",
+                "json",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        installed = json.loads(result.stdout)
+        with open(Path(self.helm_configs["chart_path"]) / "values.yaml") as file:
+            expected = yaml.safe_load(file)
+        # Compare actual values rather than a new marker, so releases installed
+        # before profile tracking also work. Other Helm values remain unrelated.
+        with open(BASE_DIR / "observer" / "prometheus" / "values-svelte.yaml") as file:
+            svelte_values = yaml.safe_load(file)
+        for component, settings in svelte_values.items():
+            for setting, svelte_value in settings.items():
+                wanted = svelte_value if is_svelte() else expected[component][setting]
+                if installed.get(component, {}).get(setting) != wanted:
+                    self.logger.info("Prometheus profile differs at %s.%s; redeploying", component, setting)
+                    return False
+        return True
 
     def _requested_helm_configs(self) -> dict:
         """The Helm config of this deployment: the metadata config plus profile and class."""
@@ -113,7 +175,9 @@ class Prometheus:
         every teardown, which is what the first campaign left behind.
         """
         Helm.uninstall(**self.helm_configs)
-        self._delete_retained_pvcs()
+        # On kind the claim is left as `main` leaves it: the next deploy deletes it before installing.
+        if not use_main_release_handling():
+            self._delete_retained_pvcs()
 
     def _wait_for_namespace_termination(self):
         """Wait for namespace to be fully deleted if it's currently in Terminating state."""

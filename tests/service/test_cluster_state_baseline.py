@@ -7,7 +7,7 @@ import pytest
 from kubernetes.client.rest import ApiException
 
 from sregym import cluster_platform
-from sregym.cluster_platform import OPENSHIFT
+from sregym.cluster_platform import KIND, OPENSHIFT
 from sregym.conductor import conductor as conductor_module
 from sregym.conductor.conductor import Conductor
 from sregym.service.cluster_state import ClusterBaseline, ClusterStateManager
@@ -235,6 +235,34 @@ def test_allow_missing_exempts_only_the_namespaces_it_names(manager, tmp_path, a
         assert manager.stale_namespaces == ["also-gone"]
 
 
+def test_without_staleness_check_a_vanished_namespace_still_loads(manager, tmp_path):
+    path = tmp_path / "baseline.json"
+    path.write_text(json.dumps({"cluster_uid": "cluster-1", "namespaces": ["gone-ns"]}))
+    manager.core_v1.list_namespace.return_value = _live_namespaces()
+
+    assert manager.load_baseline_state(path, check_staleness=False) is True
+
+    assert manager.baseline_load_status == "loaded"
+    assert manager.stale_namespaces == []
+    assert manager.baseline is not None
+    assert "gone-ns" in manager.baseline.namespaces
+    # main's path never reads the live namespace list for the staleness check.
+    manager.core_v1.list_namespace.assert_not_called()
+    for call in manager.core_v1.list_namespace.call_args_list:
+        assert "raise_on_error" not in call.kwargs
+
+
+def test_staleness_check_is_on_by_default(manager, tmp_path):
+    path = tmp_path / "baseline.json"
+    path.write_text(json.dumps({"cluster_uid": "cluster-1", "namespaces": ["gone-ns"]}))
+    manager.core_v1.list_namespace.return_value = _live_namespaces()
+
+    assert manager.load_baseline_state(path) is False
+
+    assert manager.baseline_load_status == "stale"
+    assert manager.stale_namespaces == ["gone-ns"]
+
+
 def test_a_permission_failure_while_checking_namespaces_is_not_clean(manager, tmp_path):
     path = tmp_path / "baseline.json"
     path.write_text(json.dumps({"cluster_uid": "cluster-1"}))
@@ -292,6 +320,7 @@ def _load_returns(status: str) -> MagicMock:
 
 
 def test_a_stale_baseline_is_neither_used_nor_replaced(monkeypatch, tmp_path):
+    monkeypatch.setenv("SREGYM_PLATFORM", OPENSHIFT)
     path = tmp_path / "baseline.json"
     monkeypatch.setattr(conductor_module, "CLUSTER_BASELINE_STATE_FILE", path)
     cluster_state = _load_returns("stale")
@@ -300,9 +329,29 @@ def test_a_stale_baseline_is_neither_used_nor_replaced(monkeypatch, tmp_path):
     with pytest.raises(_DeployReachedNetworking):
         conductor.deploy_app()
 
-    cluster_state.load_baseline_state.assert_called_once_with(path, allow_missing=("sregym-app",))
+    cluster_state.load_baseline_state.assert_called_once_with(path, allow_missing=("sregym-app",), check_staleness=True)
     cluster_state.save_baseline_state.assert_not_called()
     assert conductor._baseline_usable is False
+
+
+@pytest.mark.parametrize(
+    ("platform", "check_staleness"),
+    [(KIND, False), (OPENSHIFT, True)],
+)
+def test_the_baseline_staleness_check_follows_the_platform(monkeypatch, tmp_path, platform, check_staleness):
+    """On kind the snapshot loads as `main` loads it; OpenShift keeps the staleness refusal."""
+    monkeypatch.setenv("SREGYM_PLATFORM", platform)
+    path = tmp_path / "baseline.json"
+    monkeypatch.setattr(conductor_module, "CLUSTER_BASELINE_STATE_FILE", path)
+    cluster_state = _load_returns("loaded")
+    conductor = _deploy_conductor(cluster_state)
+
+    with pytest.raises(_DeployReachedNetworking):
+        conductor.deploy_app()
+
+    cluster_state.load_baseline_state.assert_called_once_with(
+        path, allow_missing=("sregym-app",), check_staleness=check_staleness
+    )
 
 
 @pytest.mark.parametrize("status", ["missing", "foreign_cluster", "corrupt"])

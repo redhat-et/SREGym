@@ -3,8 +3,9 @@
 The kind repairs patch a Calico CRD, a kube-proxy DaemonSet, kubelet thresholds
 and CoreDNS ConfigMap templates. On OpenShift those repairs either fail or hit
 objects the platform owns, so the gate has to be visible in the command list and
-in the log. The Failed-pod delete is deliberately not gated: it is namespace
-scoped on both platforms because a cluster-wide delete reaches other tenants.
+in the log. The Failed-pod delete differs by platform: kind runs `main`'s cluster-wide
+delete, and OpenShift only deletes Failed pods in the problem namespace, because a
+cluster-wide delete reaches other tenants.
 """
 
 from types import SimpleNamespace
@@ -15,10 +16,17 @@ from sregym import cluster_platform
 from sregym.cluster_platform import KIND, OPENSHIFT
 from sregym.conductor import conductor as conductor_module
 from sregym.conductor.conductor import Conductor
+from sregym.conductor.problems.kubelet_eviction_threshold_misconfig import KubeletEvictionThresholdMisconfig
 from sregym.conductor.problems.nightly_rebalance_oom import NightlyRebalanceOOM
 
 NAMESPACE = "astronomy-shop"
 FAILED_POD_DELETE = f"kubectl delete pods -n {NAMESPACE} --field-selector=status.phase=Failed --ignore-not-found=true"
+# `main`'s cluster-wide delete, verbatim.
+KIND_FAILED_POD_DELETE = (
+    "kubectl delete pods --all-namespaces "
+    f"--field-selector=status.phase=Failed,metadata.namespace!={KubeletEvictionThresholdMisconfig.NAMESPACE} "
+    "--ignore-not-found=true"
+)
 SKIPPED_REPAIRS_LOG = "[FIX] Skipping the distribution-specific repairs"
 
 
@@ -182,11 +190,10 @@ def test_kind_still_runs_every_distribution_specific_repair(monkeypatch, ledger)
     assert not [message for message in conductor.logger.infos if message.startswith(SKIPPED_REPAIRS_LOG)]
 
 
-def test_kind_deletes_failed_pods_only_in_the_problem_namespace(monkeypatch, ledger):
-    """Deleting another tenant's pods is wrong on any cluster, so this is not gated."""
+def test_kind_deletes_failed_pods_cluster_wide_as_main_does(monkeypatch, ledger):
     conductor = _conductor(monkeypatch, ledger, KIND)
 
     conductor.fix_kubernetes()
 
-    assert FAILED_POD_DELETE in ledger.commands
-    assert not [command for command in ledger.commands if "--all-namespaces" in command]
+    assert KIND_FAILED_POD_DELETE in ledger.commands
+    assert FAILED_POD_DELETE not in ledger.commands

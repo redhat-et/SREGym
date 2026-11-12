@@ -117,6 +117,24 @@ class KubeCtl:
 
         image = os.getenv("SREGYM_NETWORK_PROBE_IMAGE") or "registry.k8s.io/pause:3.10"
         suffix = uuid.uuid4().hex[:12]
+        # Kind keeps main's bare pod spec. Restricted admission (OpenShift) gets hardened
+        # contexts. run_as_user is never set: pause declares no non-root USER, so the
+        # kubelet refuses run_as_non_root unless a uid is supplied, and the SCC assigns
+        # one from the namespace's uid range (it refuses a pod that pins a uid itself).
+        if restricted_admission():
+            pod_security_context = client.V1PodSecurityContext(
+                run_as_non_root=True,
+                seccomp_profile=client.V1SeccompProfile(type="RuntimeDefault"),
+            )
+            container_security_context = client.V1SecurityContext(
+                run_as_non_root=True,
+                allow_privilege_escalation=False,
+                seccomp_profile=client.V1SeccompProfile(type="RuntimeDefault"),
+                capabilities=client.V1Capabilities(drop=["ALL"]),
+            )
+        else:
+            pod_security_context = None
+            container_security_context = None
         probes: dict[str, client.V1Pod] = {}
         cleanup_errors = []
         try:
@@ -129,27 +147,13 @@ class KubeCtl:
                         restart_policy="Never",
                         tolerations=[client.V1Toleration(operator="Exists")],
                         automount_service_account_token=False,
-                        security_context=client.V1PodSecurityContext(
-                            run_as_non_root=True,
-                            seccomp_profile=client.V1SeccompProfile(type="RuntimeDefault"),
-                        ),
+                        security_context=pod_security_context,
                         containers=[
                             client.V1Container(
                                 name="pause",
                                 image=image,
                                 image_pull_policy="IfNotPresent",
-                                security_context=client.V1SecurityContext(
-                                    run_as_non_root=True,
-                                    # `pause` declares no non-root USER, so `run_as_non_root` alone makes the
-                                    # kubelet refuse it and a numeric uid has to be pinned. Under restricted
-                                    # admission the SCC assigns a uid from the namespace's uid range and
-                                    # refuses a pod that pins one, so the uid is only set where admission
-                                    # does not restrict it.
-                                    run_as_user=None if restricted_admission() else 65535,
-                                    allow_privilege_escalation=False,
-                                    seccomp_profile=client.V1SeccompProfile(type="RuntimeDefault"),
-                                    capabilities=client.V1Capabilities(drop=["ALL"]),
-                                ),
+                                security_context=container_security_context,
                             )
                         ],
                     ),

@@ -297,7 +297,9 @@ class ClusterStateManager:
             json.dump(baseline.to_json(), f, indent=2)
         logger.info(f"Baseline state snapshot saved to {path}")
 
-    def load_baseline_state(self, path: Path, allow_missing: tuple[str, ...] = ()) -> bool:
+    def load_baseline_state(
+        self, path: Path, allow_missing: tuple[str, ...] = (), check_staleness: bool = True
+    ) -> bool:
         """
         Load a previously saved baseline state snapshot and use it as the baseline.
         Returns True if the baseline state was loaded successfully, False otherwise.
@@ -307,6 +309,9 @@ class ClusterStateManager:
         snapshot naming any other namespace that no longer exists describes a
         cluster that is gone: it cannot say what to delete, and it must not be
         replaced with a fresh capture of a cluster that may still be dirty.
+
+        `check_staleness=False` skips that namespace check and loads the snapshot
+        as main does, without reading the live namespace list.
         """
         self.stale_namespaces = []
         if not path.exists():
@@ -341,21 +346,22 @@ class ClusterStateManager:
                 if field_name not in data:
                     data[field_name] = sorted(self._get_admission_policy_names(resource))
             baseline = ClusterBaseline.from_json(data)
-            # Read with raise_on_error so a permission failure refuses the snapshot
-            # instead of looking like a cluster where everything the baseline names
-            # has disappeared.
-            live_namespaces = self._get_namespaces(raise_on_error=True)
-            stale = sorted(baseline.namespaces - live_namespaces - PROTECTED_NAMESPACES - set(allow_missing))
-            if stale:
-                logger.error(
-                    "Ignoring baseline state at %s: it names namespace(s) that no longer exist (%s), so it is "
-                    "neither usable as a reference nor replaced with a fresh capture",
-                    path,
-                    ", ".join(stale),
-                )
-                self.stale_namespaces = stale
-                self.baseline_load_status = "stale"
-                return False
+            if check_staleness:
+                # Read with raise_on_error so a permission failure refuses the snapshot
+                # instead of looking like a cluster where everything the baseline names
+                # has disappeared.
+                live_namespaces = self._get_namespaces(raise_on_error=True)
+                stale = sorted(baseline.namespaces - live_namespaces - PROTECTED_NAMESPACES - set(allow_missing))
+                if stale:
+                    logger.error(
+                        "Ignoring baseline state at %s: it names namespace(s) that no longer exist (%s), so it is "
+                        "neither usable as a reference nor replaced with a fresh capture",
+                        path,
+                        ", ".join(stale),
+                    )
+                    self.stale_namespaces = stale
+                    self.baseline_load_status = "stale"
+                    return False
             self.baseline = baseline
             self.baseline_load_status = "loaded"
             logger.info(f"Baseline state loaded from {path}")

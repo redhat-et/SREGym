@@ -1172,7 +1172,7 @@ def _run_benchmark(args, *, judge_backend: str = "api", agent_image: str | None 
 
     agent_model, judge_model = _configure_model_environment(args)
     # The platform has to be known before anything derives behaviour from it.
-    set_platform(args.platform)
+    set_platform(getattr(args, "platform", KIND))
     # A Lite suite states its OpenShift support, and refuses an excluded scenario by
     # name before any cluster work, instead of failing inside the deploy stage.
     # An excluded scenario is skipped with its reason, not a refusal: the suite runs

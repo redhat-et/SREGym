@@ -3,16 +3,18 @@
 import json
 import logging
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import pytest
 import yaml
 
-from sregym import profile, storage
+from sregym import cluster_platform, profile, storage
+from sregym.cluster_platform import OPENSHIFT
 from sregym.service import helm as helm_module
 from sregym.service.helm import UNKNOWN_VALUES_FINGERPRINT, VALUES_FINGERPRINT_ANNOTATION, Helm
 from sregym.service.telemetry.loki import Loki
 from sregym.service.telemetry.prometheus import Prometheus
+from sregym.service.telemetry.release_pvcs import use_main_release_handling
 from sregym.storage import set_storage_class
 
 
@@ -22,6 +24,15 @@ def reset_selection(monkeypatch):
     monkeypatch.delenv("SREGYM_PROFILE", raising=False)
     monkeypatch.setattr(storage, "_storage_class", None)
     monkeypatch.delenv("SREGYM_STORAGE_CLASS", raising=False)
+    monkeypatch.setattr(cluster_platform, "_platform", None)
+    monkeypatch.delenv("SREGYM_PLATFORM", raising=False)
+
+
+@pytest.fixture
+def openshift(monkeypatch):
+    """Select the OpenShift path, where the release fingerprint decides reuse and redeploys."""
+    monkeypatch.setattr(cluster_platform, "_platform", None)
+    monkeypatch.setenv("SREGYM_PLATFORM", OPENSHIFT)
 
 
 class FakeCluster:
@@ -262,6 +273,7 @@ def test_a_failed_annotation_is_a_warning_not_a_failure(cluster, caplog):
 # ---------------------------------------------------------------------------- Prometheus
 
 
+@pytest.mark.usefixtures("openshift")
 def test_prometheus_reuses_the_release_it_recorded(monkeypatch, cluster, helm):
     prometheus = Prometheus()
     monkeypatch.setattr(prometheus, "_is_prometheus_running", lambda: False)
@@ -284,6 +296,7 @@ def test_prometheus_reuses_the_release_it_recorded(monkeypatch, cluster, helm):
     assert cluster.annotated("prometheus") is None
 
 
+@pytest.mark.usefixtures("openshift")
 def test_prometheus_redeploys_when_the_fingerprint_differs(monkeypatch, cluster, helm):
     prometheus = Prometheus()
     monkeypatch.setattr(prometheus, "_is_prometheus_running", lambda: True)
@@ -303,6 +316,7 @@ def test_prometheus_redeploys_when_the_fingerprint_differs(monkeypatch, cluster,
 # ---------------------------------------------------------------------------------- Loki
 
 
+@pytest.mark.usefixtures("openshift")
 def test_loki_reuses_the_release_it_recorded(monkeypatch, cluster, helm):
     loki = Loki()
     monkeypatch.setattr(loki, "_add_grafana_helm_repo", lambda: None)
@@ -326,6 +340,7 @@ def test_loki_reuses_the_release_it_recorded(monkeypatch, cluster, helm):
     assert cluster.annotated("loki") is None
 
 
+@pytest.mark.usefixtures("openshift")
 def test_loki_redeploys_and_deletes_its_claims_when_the_fingerprint_differs(monkeypatch, cluster, helm):
     loki = Loki()
     monkeypatch.setattr(loki, "_add_grafana_helm_repo", lambda: None)
@@ -346,6 +361,7 @@ def test_loki_redeploys_and_deletes_its_claims_when_the_fingerprint_differs(monk
     assert cluster.annotated("loki") == Helm.requested_values_fingerprint(helm.install.call_args.kwargs)
 
 
+@pytest.mark.usefixtures("openshift")
 def test_a_changed_storage_class_redeploys_loki(monkeypatch, cluster, helm):
     loki = Loki()
     monkeypatch.setattr(loki, "_add_grafana_helm_repo", lambda: None)
@@ -369,6 +385,7 @@ def test_a_changed_storage_class_redeploys_loki(monkeypatch, cluster, helm):
 # ------------------------------------------------------------------------------ Promtail
 
 
+@pytest.mark.usefixtures("openshift")
 def test_promtail_reuses_the_release_it_recorded(monkeypatch, cluster, helm):
     loki = Loki()
     monkeypatch.setattr(loki, "_is_promtail_running", lambda: False)
@@ -387,6 +404,7 @@ def test_promtail_reuses_the_release_it_recorded(monkeypatch, cluster, helm):
     assert cluster.annotated("promtail") is None
 
 
+@pytest.mark.usefixtures("openshift")
 def test_promtail_redeploys_when_its_values_file_changes(monkeypatch, cluster, helm, tmp_path):
     loki = Loki()
     values_file = tmp_path / "promtail-values.yaml"
@@ -405,9 +423,10 @@ def test_promtail_redeploys_when_its_values_file_changes(monkeypatch, cluster, h
     loki._deploy_promtail()
 
     helm.install.assert_called_once()
-    assert helm.install.call_args.kwargs["extra_args"] == ["-f", str(values_file)]
+    assert helm.install.call_args.kwargs["extra_args"][:2] == ["-f", str(values_file)]
 
 
+@pytest.mark.usefixtures("openshift")
 def test_promtail_uninstalls_a_stale_release_before_installing(monkeypatch, cluster, helm):
     """A release that exists but does not run makes `helm install` fail with "cannot
     reuse a name that is still in use"; it is removed first. A cluster that refused
@@ -424,6 +443,7 @@ def test_promtail_uninstalls_a_stale_release_before_installing(monkeypatch, clus
     assert cluster.commands.index(["uninstall"]) < cluster.commands.index(["install"])
 
 
+@pytest.mark.usefixtures("openshift")
 def test_promtail_reinstall_does_not_raise_when_its_pods_are_never_admitted(monkeypatch, cluster, helm):
     """A cluster whose SCCs refuse Promtail's pods leaves the release installed and no
     pod running. A repeated deploy must reinstall and return, not raise: the fault
@@ -439,6 +459,7 @@ def test_promtail_reinstall_does_not_raise_when_its_pods_are_never_admitted(monk
 
     helm.uninstall.assert_called_once_with(release_name="promtail", namespace="observe")
     helm.install.assert_called_once()
+
 
 # ----------------------------------------------------------- Promtail's running-and-ready question
 
@@ -489,3 +510,158 @@ def test_no_promtail_pod_does_not_count_as_running(monkeypatch):
     )
 
     assert Loki()._is_promtail_running() is False
+
+
+# ------------------------------------------------------------- kind: the deploy `main` makes
+
+
+def test_use_main_release_handling_only_on_kind_with_openebs(monkeypatch):
+    assert use_main_release_handling() is True
+    set_storage_class("gp3")
+    assert use_main_release_handling() is False
+    set_storage_class("openebs-hostpath")
+    monkeypatch.setenv("SREGYM_PLATFORM", OPENSHIFT)
+    monkeypatch.setattr(cluster_platform, "_platform", None)
+    assert use_main_release_handling() is False
+
+
+def test_kind_loki_deploy_is_main_s_deploy(monkeypatch, cluster, helm):
+    loki = Loki()
+    monkeypatch.setattr(loki, "_is_loki_running", lambda: False)
+    monkeypatch.setattr(loki, "_add_grafana_helm_repo", MagicMock())
+    promtail = MagicMock()
+    monkeypatch.setattr(loki, "_deploy_promtail", promtail)
+    cleanup = MagicMock()
+    monkeypatch.setattr(loki, "_delete_retained_pvcs", cleanup)
+    order = []
+    helm.uninstall.side_effect = lambda **_: order.append("uninstall")
+    helm.install.side_effect = lambda **_: order.append("install")
+    loki._add_grafana_helm_repo.side_effect = lambda: order.append("repo")
+
+    loki.deploy()
+
+    assert order == ["uninstall", "repo", "install"]
+    helm.uninstall.assert_called_once_with(**loki.helm_configs)
+    helm.install.assert_called_once_with(**loki.helm_configs)
+    helm.assert_if_deployed.assert_called_once_with("observe")
+    promtail.assert_called_once_with()
+    cleanup.assert_not_called()
+    assert not [command for command in cluster.commands if command[:3] == ["kubectl", "annotate", "secret"]]
+
+
+def test_kind_loki_running_skips_the_redeploy_and_keeps_promtail_logic(monkeypatch, cluster, helm, caplog):
+    loki = Loki()
+    monkeypatch.setattr(loki, "_is_loki_running", lambda: True)
+    promtail = MagicMock()
+    monkeypatch.setattr(loki, "_deploy_promtail", promtail)
+
+    loki.deploy()
+
+    assert "Loki is already running. Skipping redeployment." in caplog.text
+    promtail.assert_called_once_with()
+    helm.uninstall.assert_not_called()
+    helm.install.assert_not_called()
+    assert cluster.commands == []
+
+
+def test_kind_promtail_skips_when_any_row_says_running(monkeypatch, cluster, helm):
+    """`main` skips Promtail on the word Running alone, so a 0/1 pod that runs is kept."""
+    monkeypatch.setattr(
+        "sregym.service.telemetry.loki.KubeCtl",
+        lambda: _PodsListed("NAME READY STATUS\npromtail-abc 0/1 Running"),
+    )
+    monkeypatch.setattr(
+        Loki,
+        "_is_promtail_running",
+        MagicMock(side_effect=AssertionError("kind must not use the readiness check")),
+    )
+
+    Loki()._deploy_promtail()
+
+    helm.install.assert_not_called()
+    helm.uninstall.assert_not_called()
+    assert cluster.commands == []
+
+
+def test_kind_promtail_installs_with_main_arguments(monkeypatch, cluster, helm):
+    loki = Loki()
+    monkeypatch.setattr(
+        "sregym.service.telemetry.loki.KubeCtl",
+        lambda: _PodsListed("No resources found in observe namespace."),
+    )
+
+    loki._deploy_promtail()
+
+    helm.install.assert_called_once_with(
+        release_name="promtail",
+        chart_path="grafana/promtail",
+        namespace="observe",
+        remote_chart=True,
+        extra_args=["-f", loki.promtail_values_file],
+    )
+    helm.assert_if_deployed.assert_called_once_with("observe")
+    helm.uninstall.assert_not_called()
+    assert cluster.commands == []
+
+
+def test_kind_prometheus_deploy_is_main_s_deploy(monkeypatch, cluster, helm):
+    prometheus = Prometheus()
+    monkeypatch.setattr(prometheus, "_is_prometheus_running", lambda: False)
+    monkeypatch.setattr(prometheus, "_wait_for_namespace_termination", lambda: None)
+    cleanup = MagicMock()
+    monkeypatch.setattr(prometheus, "_delete_retained_pvcs", cleanup)
+    query = MagicMock()
+    monkeypatch.setattr(prometheus, "_matches_requested_profile", query)
+
+    prometheus.deploy()
+
+    query.assert_not_called()
+    cleanup.assert_called_once_with()
+    helm.uninstall.assert_called_once_with(**prometheus.helm_configs)
+    helm.install.assert_called_once_with(**prometheus.helm_configs)
+    helm.assert_if_deployed.assert_called_once_with("observe")
+    assert cluster.commands == []
+
+
+def test_kind_prometheus_reuses_a_release_that_matches_the_values_listing(monkeypatch, helm):
+    prometheus = Prometheus()
+    monkeypatch.setattr(prometheus, "_is_prometheus_running", lambda: True)
+    monkeypatch.setattr(prometheus, "_matches_requested_profile", lambda: True)
+    monkeypatch.setattr(prometheus, "_delete_retained_pvcs", MagicMock())
+
+    prometheus.deploy()
+
+    helm.install.assert_not_called()
+    helm.uninstall.assert_not_called()
+    prometheus._delete_retained_pvcs.assert_not_called()
+
+
+def test_kind_teardown_leaves_the_claim_as_main_does(monkeypatch, helm):
+    prometheus = Prometheus()
+    cleanup = MagicMock()
+    monkeypatch.setattr(prometheus, "_delete_retained_pvcs", cleanup)
+
+    prometheus.teardown()
+
+    helm.uninstall.assert_called_once_with(**prometheus.helm_configs)
+    cleanup.assert_not_called()
+
+
+def test_openshift_teardown_deletes_the_retained_claim(monkeypatch, helm, openshift):
+    prometheus = Prometheus()
+    cleanup = MagicMock()
+    monkeypatch.setattr(prometheus, "_delete_retained_pvcs", cleanup)
+
+    prometheus.teardown()
+
+    helm.uninstall.assert_called_once_with(**prometheus.helm_configs)
+    cleanup.assert_called_once_with()
+
+
+def test_kind_loki_teardown_is_unchanged(helm):
+    loki = Loki()
+    loki.teardown()
+    assert helm.uninstall.call_args_list == [
+        call(**loki.helm_configs),
+        call(release_name="promtail", namespace="observe"),
+    ]

@@ -51,7 +51,20 @@ def _created_probe(api):
     return api.create_namespaced_pod.call_args.kwargs["body"]
 
 
-def test_probe_pod_carries_a_restricted_pod_security_context(networking):
+def test_probe_pod_and_container_have_no_security_context_on_kind(networking):
+    # Kind keeps main's bare probe spec.
+    subject, api = networking
+    assert cluster_platform.get_platform() == KIND
+
+    subject.assert_pod_networking(timeout=1)
+
+    pod = _created_probe(api)
+    assert pod.spec.security_context is None
+    assert pod.spec.containers[0].security_context is None
+
+
+def test_probe_pod_carries_a_restricted_pod_security_context_on_openshift(networking, monkeypatch):
+    monkeypatch.setenv("SREGYM_PLATFORM", OPENSHIFT)
     subject, api = networking
 
     subject.assert_pod_networking(timeout=1)
@@ -59,22 +72,6 @@ def test_probe_pod_carries_a_restricted_pod_security_context(networking):
     security_context = _created_probe(api).spec.security_context
     assert security_context.run_as_non_root is True
     assert security_context.seccomp_profile.type == "RuntimeDefault"
-
-
-def test_probe_container_runs_as_an_explicit_non_root_user_without_capabilities(networking):
-    subject, api = networking
-
-    subject.assert_pod_networking(timeout=1)
-
-    security_context = _created_probe(api).spec.containers[0].security_context
-    assert security_context.run_as_non_root is True
-    # pause declares no non-root USER, so runAsNonRoot alone is refused by the kubelet.
-    # The default platform is kind, which does not assign a uid for us.
-    assert cluster_platform.get_platform() == KIND
-    assert security_context.run_as_user == 65535
-    assert security_context.allow_privilege_escalation is False
-    assert security_context.seccomp_profile.type == "RuntimeDefault"
-    assert security_context.capabilities.drop == ["ALL"]
 
 
 def test_probe_container_lets_restricted_admission_assign_the_uid(networking, monkeypatch):

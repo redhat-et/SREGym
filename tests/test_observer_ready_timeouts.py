@@ -18,12 +18,32 @@ from sregym.service import kubectl as kubectl_module
 OBSERVERS = [OtelCollector, IngressNginx]
 
 
-@pytest.mark.parametrize("observer_class", OBSERVERS)
-def test_the_wait_defaults_to_the_shared_constant(observer_class):
-    default = observer_class._wait_for_ready.__defaults__[0]
+class _FakeClock:
+    """Stands in for the `time` module so the wait loop runs without real sleeps."""
 
-    assert default == kubectl_module.WAIT_FOR_POD_READY_TIMEOUT
-    assert default != 120
+    def __init__(self):
+        self.now = 0.0
+
+    def time(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+@pytest.mark.parametrize("observer_class", OBSERVERS)
+@pytest.mark.parametrize("openshift", [False, True])
+def test_the_default_wait_depends_on_the_platform(monkeypatch, observer_class, openshift):
+    module = importlib.import_module(observer_class.__module__)
+    monkeypatch.setattr(module, "time", _FakeClock())
+    monkeypatch.setattr(module, "is_openshift", lambda: openshift)
+    observer = observer_class()
+    # A pod that never becomes ready: the wait gives up after its default timeout.
+    monkeypatch.setattr(observer, "run_cmd", lambda command: "{}")
+
+    expected = module.WAIT_FOR_POD_READY_TIMEOUT if openshift else 120
+    with pytest.raises(RuntimeError, match=rf"within {expected}s"):
+        observer._wait_for_ready()
 
 
 @pytest.mark.parametrize("observer_class", OBSERVERS)

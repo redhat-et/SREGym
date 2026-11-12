@@ -517,42 +517,40 @@ def test_a_retain_class_only_warns(caplog):
 
 # ------------------------------------------------ the openebs-hostpath default patch
 
-
-@pytest.mark.parametrize(
-    ("classes", "defaults", "patched", "log_fragment"),
-    [
-        (
-            [storage_class(storage.OPENebs, provisioner="openebs.io/local"), storage_class("gp3-csi")],
-            ["gp3-csi"],
-            False,
-            "deliberate kind behaviour change",
-        ),
-        (
-            [storage_class(storage.OPENebs, provisioner="openebs.io/local")],
-            [],
-            True,
-            "no storage class was the default",
-        ),
-        (
-            [storage_class(storage.OPENebs, provisioner="openebs.io/local")],
-            [storage.OPENebs],
-            True,
-            "it is already the default",
-        ),
-    ],
+# `main`'s command, verbatim. The kind branch must issue exactly this and nothing else.
+KIND_DEFAULT_PATCH = (
+    "kubectl patch storageclass openebs-hostpath "
+    '-p \'{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}\''
 )
-def test_the_default_class_patch_respects_an_existing_default(classes, defaults, patched, log_fragment, caplog):
-    cluster = Cluster(classes, defaults=defaults)
+
+
+@pytest.mark.parametrize("defaults", [[], ["gp3-csi"], [storage.OPENebs]])
+def test_kind_patches_openebs_hostpath_as_default_as_main_does(monkeypatch, defaults):
+    """On kind the patch is unconditional and reads nothing first, as on `main`."""
+    monkeypatch.setenv("SREGYM_PLATFORM", cluster_platform.KIND)
+    cluster = Cluster(
+        [storage_class(storage.OPENebs, provisioner="openebs.io/local"), storage_class("gp3-csi")], defaults=defaults
+    )
     conductor = conductor_reading(cluster)
-    caplog.set_level(logging.INFO)
 
     conductor._make_openebs_hostpath_default()
 
-    patches = [command for command in cluster.commands if command.startswith("kubectl patch storageclass")]
-    assert bool(patches) is patched
-    assert any(log_fragment in record.getMessage() for record in caplog.records)
-    if not patched:
-        assert any("gp3-csi" in record.getMessage() for record in caplog.records)
+    assert cluster.commands == [KIND_DEFAULT_PATCH]
+
+
+def test_openshift_leaves_the_cluster_default_storage_class_alone(monkeypatch):
+    monkeypatch.setenv("SREGYM_PLATFORM", cluster_platform.OPENSHIFT)
+    cluster = Cluster(
+        [storage_class(storage.OPENebs, provisioner="openebs.io/local"), storage_class("gp3-csi")], defaults=["gp3-csi"]
+    )
+    conductor = conductor_reading(cluster)
+    conductor.logger = MagicMock()
+
+    conductor._make_openebs_hostpath_default()
+
+    assert cluster.commands == []
+    conductor.logger.info.assert_called_once()
+    assert "Not touching the cluster's default storage class" in conductor.logger.info.call_args.args[0]
 
 
 # ------------------------------------------------------- Prometheus and Loki Helm args

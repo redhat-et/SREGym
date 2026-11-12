@@ -5,6 +5,7 @@ import shlex
 import subprocess
 import time
 
+from sregym.cluster_platform import is_openshift
 from sregym.service.kubectl import WAIT_FOR_POD_READY_TIMEOUT
 from sregym.service.rollout import deployment_rollout_complete
 
@@ -105,8 +106,13 @@ class IngressNginx:
                     )
                 )
 
-    def _wait_for_ready(self, timeout: int = WAIT_FOR_POD_READY_TIMEOUT):
-        """Wait until the ingress controller deployment is ready."""
+    def _wait_for_ready(self, timeout: int | None = None):
+        """Wait until the ingress controller deployment is ready.
+
+        Kind keeps main's 120 s; OpenShift uses the shared WAIT_FOR_POD_READY_TIMEOUT.
+        """
+        if timeout is None:
+            timeout = WAIT_FOR_POD_READY_TIMEOUT if is_openshift() else 120
         t0 = time.time()
         while time.time() - t0 < timeout:
             try:

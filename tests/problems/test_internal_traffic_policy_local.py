@@ -68,12 +68,18 @@ def _node(name, *, labels=None, taints=(), unschedulable=False):
     )
 
 
-def test_worker_nodes_skip_tainted_cordoned_and_control_plane_nodes():
-    """A pin on a node the pods cannot land on leaves the pod Pending until the rollout times out.
-
-    ROSA's `infra` workers carry a NoSchedule taint and sort before the plain workers, so the
-    first two names were the wrong ones.
-    """
+@pytest.mark.parametrize(
+    ("openshift", "expected"),
+    [
+        # On OpenShift a pin on a node the pods cannot land on leaves the pod Pending until the rollout
+        # times out; ROSA's `infra` workers carry a NoSchedule taint and sort before the plain workers.
+        (True, ["e-worker", "f-worker"]),
+        # On kind the node filter is main's: only control-plane nodes are dropped.
+        (False, ["a-infra", "b-cordoned", "d-evicting", "e-worker", "f-worker"]),
+    ],
+)
+def test_worker_nodes_filter_depends_on_platform(monkeypatch, openshift, expected):
+    monkeypatch.setattr("sregym.conductor.problems.internal_traffic_policy_local.is_openshift", lambda: openshift)
     problem = InternalTrafficPolicyLocalAstronomyShop.__new__(InternalTrafficPolicyLocalAstronomyShop)
     problem.kubectl = Mock()
     problem.kubectl.list_nodes.return_value = SimpleNamespace(
@@ -87,5 +93,5 @@ def test_worker_nodes_skip_tainted_cordoned_and_control_plane_nodes():
         ]
     )
 
-    assert problem.worker_nodes() == ["e-worker", "f-worker"]
-    assert problem._select_nodes() == ("e-worker", "f-worker")
+    assert problem.worker_nodes() == expected
+    assert problem._select_nodes() == (expected[0], expected[1])

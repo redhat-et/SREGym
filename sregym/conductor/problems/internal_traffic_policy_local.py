@@ -59,6 +59,7 @@ import time
 from kubernetes import client
 from kubernetes.client.rest import ApiException
 
+from sregym.cluster_platform import is_openshift
 from sregym.conductor.oracles.internal_traffic_policy_mitigation import InternalTrafficPolicyMitigationOracle
 from sregym.conductor.oracles.llm_as_a_judge.llm_as_a_judge_oracle import LLMAsAJudgeOracle
 from sregym.conductor.problems.base import Problem
@@ -143,16 +144,18 @@ class InternalTrafficPolicyLocalAstronomyShop(Problem):
     def worker_nodes(self) -> list[str]:
         """Return the sorted names of the nodes this scenario's pods can run on.
 
-        A control-plane node is not a worker, and neither is a node the pods cannot land on: a
-        `NoSchedule` or `NoExecute` taint (OpenShift's `infra` workers carry one) or a cordon.
-        The injector pins a Deployment to a node with a `nodeSelector`, and these pods have no
-        tolerations, so a pin on a tainted node leaves the pod Pending until the rollout times out.
+        A control-plane node is not a worker. On OpenShift a node the pods cannot land on is also
+        excluded: a `NoSchedule` or `NoExecute` taint (OpenShift's `infra` workers carry one) or a
+        cordon. The injector pins a Deployment to a node with a `nodeSelector`, and these pods have
+        no tolerations, so a pin on a tainted node leaves the pod Pending until the rollout times out.
         The mitigation oracle asks this same method, so it never demands an endpoint on such a node.
+        On kind only the control-plane check applies, as on main.
         """
         return sorted(
             node.metadata.name
             for node in self.kubectl.list_nodes().items
-            if not _CONTROL_PLANE_LABELS & set((node.metadata.labels or {}).keys()) and _accepts_pods(node)
+            if not _CONTROL_PLANE_LABELS & set((node.metadata.labels or {}).keys())
+            and (not is_openshift() or _accepts_pods(node))
         )
 
     def _select_nodes(self) -> tuple[str, str]:

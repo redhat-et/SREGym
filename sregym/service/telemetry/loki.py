@@ -6,7 +6,7 @@ from sregym.cluster_platform import is_openshift
 from sregym.paths import BASE_DIR, LOKI_METADATA
 from sregym.service.helm import Helm
 from sregym.service.kubectl import KubeCtl
-from sregym.service.telemetry.release_pvcs import delete_retained_pvcs
+from sregym.service.telemetry.release_pvcs import delete_retained_pvcs, use_main_release_handling
 from sregym.storage import get_storage_class, uses_openebs
 
 
@@ -80,6 +80,10 @@ class Loki:
 
     def deploy(self):
         """Deploy Loki using Helm."""
+        if use_main_release_handling():
+            self._deploy_as_on_main()
+            return
+
         helm_configs = self._requested_helm_configs()
         if self._is_loki_running() and Helm.release_matches_requested_values(helm_configs):
             self.logger.info("Loki runs the requested values. Reusing the release.")
@@ -95,6 +99,22 @@ class Loki:
 
         Helm.install(**helm_configs)
         Helm.record_values_fingerprint(helm_configs)
+        Helm.assert_if_deployed(self.namespace)
+        self._deploy_promtail()
+
+    def _deploy_as_on_main(self):
+        """The kind deploy, call for call as `main` makes it: no fingerprint, no PVC cleanup."""
+        if self._is_loki_running():
+            self.logger.warning("Loki is already running. Skipping redeployment.")
+            self._deploy_promtail()
+            return
+
+        Helm.uninstall(**self.helm_configs)
+
+        # Add Grafana Helm repo for Loki chart
+        self._add_grafana_helm_repo()
+
+        Helm.install(**self.helm_configs)
         Helm.assert_if_deployed(self.namespace)
         self._deploy_promtail()
 
@@ -145,6 +165,10 @@ class Loki:
         return False
 
     def _deploy_promtail(self):
+        if use_main_release_handling():
+            self._deploy_promtail_as_on_main()
+            return
+
         helm_configs = self._promtail_helm_configs()
         if self._is_promtail_running() and Helm.release_matches_requested_values(helm_configs):
             self.logger.info("Promtail runs the requested values. Skipping redeployment.")
@@ -164,6 +188,33 @@ class Loki:
         Helm.install(**helm_configs)
         Helm.record_values_fingerprint(helm_configs)
         Helm.assert_if_deployed(self.namespace)
+
+    def _deploy_promtail_as_on_main(self):
+        """The kind Promtail deploy, call for call as `main` makes it."""
+        if self._is_promtail_listed_running():
+            self.logger.warning("Promtail is already running. Skipping redeployment.")
+            return
+
+        self.logger.info("Deploying Promtail for Loki log collection...")
+        Helm.install(
+            release_name=self.promtail_release_name,
+            chart_path="grafana/promtail",
+            namespace=self.namespace,
+            remote_chart=True,
+            extra_args=["-f", self.promtail_values_file],
+        )
+        Helm.assert_if_deployed(self.namespace)
+
+    def _is_promtail_listed_running(self) -> bool:
+        """Check if Promtail is already running in the cluster (`main`'s test: any row says Running)."""
+        command = f"kubectl get pods -n {self.namespace} -l app.kubernetes.io/name=promtail"
+        try:
+            result = KubeCtl().exec_command(command)
+            if "Running" in result:
+                return True
+        except subprocess.CalledProcessError:
+            return False
+        return False
 
     def _promtail_helm_configs(self) -> dict:
         """The Helm config of this deployment: the Promtail chart and its values file."""
