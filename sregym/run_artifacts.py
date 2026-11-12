@@ -2,6 +2,8 @@
 
 import contextlib
 import csv
+import functools
+import hashlib
 import json
 import os
 import secrets
@@ -11,11 +13,65 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from sregym.cluster_platform import get_platform
 from sregym.service.container_runner import DEFAULT_AGENT_IMAGE
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_APPLICATIONS_DIR = _REPO_ROOT / "SREGym-applications"
 
 
 class ArtifactFinalizationError(RuntimeError):
     """An opaque artifact tree could not be safely published."""
+
+
+def _git_output(args: list[str], cwd: Path) -> str | None:
+    """Stdout of a git command, or None when it cannot be run or fails."""
+    try:
+        result = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def _dirty(porcelain: str | None) -> str:
+    if porcelain is None:
+        return "unknown"
+    return "true" if porcelain else "false"
+
+
+def _diff_fingerprint(diff: str | None) -> str:
+    """Short hash of a submodule's working-tree diff, so two runs can be compared by content."""
+    if diff is None:
+        return "unknown"
+    if not diff:
+        return "clean"
+    return hashlib.sha256(diff.encode()).hexdigest()[:12]
+
+
+@functools.cache
+def run_provenance() -> dict[str, str]:
+    """Code and platform that produced this run, computed once per process.
+
+    Every field is "unknown" when it cannot be read. This never raises, so a missing
+    git binary or submodule cannot abort a run.
+    """
+    git_sha = _git_output(["rev-parse", "HEAD"], _REPO_ROOT)
+    git_status = _git_output(["status", "--porcelain", "--untracked-files=no", "--ignore-submodules=dirty"], _REPO_ROOT)
+    submodule_sha = _git_output(["rev-parse", "HEAD"], _APPLICATIONS_DIR)
+    submodule_status = _git_output(["status", "--porcelain"], _APPLICATIONS_DIR)
+    submodule_diff = _git_output(["diff"], _APPLICATIONS_DIR)
+    try:
+        platform = get_platform()
+    except ValueError:
+        platform = "unknown"
+    return {
+        "run.git_sha": git_sha or "unknown",
+        "run.git_dirty": _dirty(git_status),
+        "run.submodule_sha": submodule_sha or "unknown",
+        "run.submodule_dirty": _dirty(submodule_status),
+        "run.submodule_diff_sha": _diff_fingerprint(submodule_diff),
+        "run.platform": platform,
+    }
 
 
 @dataclass(frozen=True)

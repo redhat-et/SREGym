@@ -180,3 +180,37 @@ def test_a_selection_that_keeps_something_is_returned_without_the_skips(on_opens
     assert len(kept) == len(selection) - 1
     assert EXCLUDED["sregym-lite"] not in kept
     assert kept == [pid for pid in selection if pid != EXCLUDED["sregym-lite"]]
+
+
+@pytest.mark.parametrize("suite", LITE_SETS)
+def test_problem_flag_naming_the_excluded_scenario_is_refused_on_openshift(on_openshift, suite):
+    """--problem names one scenario, so an excluded one is refused by name, not skipped to nothing."""
+    refusal = on_openshift.platform_problem_refusal(EXCLUDED[suite])
+
+    assert refusal is not None
+    assert refusal.startswith(f"Refusing --problem {EXCLUDED[suite]} on openshift")
+    assert PLATFORM_SUPPORT[EXCLUDED[suite]]["reason"] in refusal
+
+
+def test_problem_flag_naming_a_working_scenario_is_not_refused(on_openshift):
+    assert on_openshift.platform_problem_refusal("network_policy_block") is None
+
+
+def test_problem_flag_is_never_refused_on_kind(on_kind):
+    assert on_kind.platform_problem_refusal(EXCLUDED["sregym-lite"]) is None
+
+
+def test_problem_flag_absent_or_outside_the_table_is_not_refused(on_openshift):
+    assert on_openshift.platform_problem_refusal(None) is None
+    assert on_openshift.platform_problem_refusal("") is None
+    assert on_openshift.platform_problem_refusal("not_a_registered_problem") is None
+
+
+def test_problem_refusal_fires_before_any_cluster_work_in_run_benchmark():
+    """The refusal sits next to the suite skip, ahead of storage, reconcile, isolation and deploy."""
+    source = (Path(__file__).resolve().parents[1] / "main.py").read_text()
+    body = source[source.index("def _run_benchmark(") :]
+    refusal_at = body.index('platform_problem_refusal(getattr(args, "problem", None))')
+    assert refusal_at < body.index("set_storage_class(")
+    assert refusal_at < body.index("LAUNCHER.enable_container_isolation(")
+    assert refusal_at < body.index("Conductor(")

@@ -50,7 +50,7 @@ from sregym.phases import read_ledger as read_phase_ledger
 from sregym.phases import results_columns as phase_results_columns
 from sregym.profile import PROFILES, get_profile, set_profile
 from sregym.results.resume import complete_resume_rows
-from sregym.run_artifacts import ArtifactFinalizationError, RunArtifacts, stabilize_run_csv_headers
+from sregym.run_artifacts import ArtifactFinalizationError, RunArtifacts, run_provenance, stabilize_run_csv_headers
 from sregym.service.cluster_state import RECONCILE_MODES
 from sregym.service.container_runner import ContainerRunner, ExecInput, get_container_host_bind_address
 from sregym.service.internet_policy import EndpointRule, InternetPolicy
@@ -627,6 +627,7 @@ def driver_loop(
                         "attempt": attempt,
                         "deployment_profile": get_profile(),
                         "deploy_failed": True,
+                        **run_provenance(),
                     }
                     for stage, outcome in conductor.results.items():
                         if isinstance(outcome, dict):
@@ -871,6 +872,7 @@ def driver_loop(
                     "attempt": attempt,
                     "deployment_profile": get_profile(),
                     "judge_backend": judge_backend,
+                    **run_provenance(),
                 }
                 if os.environ.get("AGENT_JEV_MODEL"):
                     snapshot["jev_model"] = os.environ["AGENT_JEV_MODEL"]
@@ -1107,10 +1109,11 @@ def platform_support_skips(suite: str | None) -> list[str]:
     at all off ``openshift``: the table is an OpenShift statement, and ``kind``
     output is compared against recorded transcripts.
 
-    An excluded scenario is skipped, not refused: one scenario the platform cannot
-    express does not invalidate the sixteen it can, and refusing the whole suite
-    bought nothing that a named skip does not. Every Lite set is checked, so the
-    skip cannot be bypassed by naming the other set.
+    For ``--suite``, an excluded scenario is skipped, not refused: one scenario the
+    platform cannot express does not invalidate the sixteen it can, and refusing the
+    whole suite bought nothing that a named skip does not. Every Lite set is checked,
+    so the skip cannot be bypassed by naming the other set. ``--problem`` names one
+    scenario, so it is refused instead (``platform_problem_refusal``).
     """
     if suite is None or not is_openshift():
         return []
@@ -1140,6 +1143,24 @@ def platform_support_skips(suite: str | None) -> list[str]:
             f"({PLATFORM_SUPPORT[excluded[0]]['reason']}). The rest of the suite runs. See docs/openshift.md."
         )
     return excluded
+
+
+def platform_problem_refusal(problem: str | None) -> str | None:
+    """Return the refusal for ``--problem`` naming a scenario this platform excludes, or None.
+
+    ``--suite`` skips an excluded scenario with its reason; ``--problem`` names exactly one
+    scenario, so skipping it would run nothing. It is refused by name before any cluster
+    work. Off ``openshift`` and for scenarios outside the table, there is no refusal.
+    """
+    if not problem or not is_openshift():
+        return None
+    entry = PLATFORM_SUPPORT.get(problem)
+    if entry is None or entry["verdict"] != "exclude":
+        return None
+    return (
+        f"Refusing --problem {problem} on openshift: it cannot be expressed on this platform "
+        f"({entry['reason']}). Re-run without it, or pick another scenario. See docs/openshift.md."
+    )
 
 
 def apply_platform_skips(suite: str | None, selection, skips) -> list[str]:
@@ -1178,6 +1199,10 @@ def _run_benchmark(args, *, judge_backend: str = "api", agent_image: str | None 
     # An excluded scenario is skipped with its reason, not a refusal: the suite runs
     # without it. Printed once here; the selection filter below consumes the same list.
     _suite_skips = platform_support_skips(getattr(args, "suite", None))
+    # --problem names one scenario, so there is nothing to skip to: an excluded one is refused here.
+    platform_refusal = platform_problem_refusal(getattr(args, "problem", None))
+    if platform_refusal:
+        sys.exit(platform_refusal)
     # The storage class is caller input, so it is checked before any chart names it.
     # tests build args without the flag, hence getattr.
     storage_class = getattr(args, "storage_class", None)

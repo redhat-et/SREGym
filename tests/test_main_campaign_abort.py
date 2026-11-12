@@ -324,7 +324,17 @@ def test_deployment_retries_only_transient_failures(
     )
     conductor.bind_phase_ledger.assert_called_once()
     assert results == [
-        {None: [{"problem_id": "problem", "attempt": 1, "deployment_profile": "full", "deploy_failed": True}]}
+        {
+            None: [
+                {
+                    "problem_id": "problem",
+                    "attempt": 1,
+                    "deployment_profile": "full",
+                    "deploy_failed": True,
+                    **benchmark_main.run_provenance(),
+                }
+            ]
+        }
     ]
 
 

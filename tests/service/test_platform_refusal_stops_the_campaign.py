@@ -67,7 +67,17 @@ def test_a_platform_refusal_is_attempted_once_and_records_the_failure(monkeypatc
 
     conductor.start_problem.assert_awaited_once()
     assert raised.value.partial_results == [
-        {None: [{"problem_id": "problem", "attempt": 1, "deployment_profile": "full", "deploy_failed": True}]}
+        {
+            None: [
+                {
+                    "problem_id": "problem",
+                    "attempt": 1,
+                    "deployment_profile": "full",
+                    "deploy_failed": True,
+                    **benchmark_main.run_provenance(),
+                }
+            ]
+        }
     ]
     assert "does not confirm the declared platform" in str(raised.value)
 
