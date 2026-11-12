@@ -93,5 +93,6 @@ class Jaeger:
             self.run_cmd(f"kubectl rollout restart daemonset/otel-collector-agent -n {namespace}")
             self.run_cmd(f"kubectl rollout status daemonset/otel-collector-agent -n {namespace} --timeout=180s")
             logger.info(f"Restarted otel-collector-agent DaemonSet in namespace '{namespace}'")
-        except Exception:
-            pass  # DaemonSet may not exist in every namespace
+        except Exception as exc:
+            # DaemonSet may not exist in every namespace
+            logger.warning(f"otel-collector-agent rollout in '{namespace}' did not complete: {exc}")

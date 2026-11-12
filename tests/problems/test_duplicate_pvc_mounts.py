@@ -1,5 +1,7 @@
 from types import SimpleNamespace
+from unittest.mock import Mock
 
+import pytest
 import yaml
 from kubernetes.client.rest import ApiException
 
@@ -193,3 +195,35 @@ def test_recovery_requires_the_saved_deployment_before_deleting_resources(tmp_pa
 
     assert kubectl.commands == []
     assert kubectl.core_v1_api.claims == {"jaeger-pvc"}
+
+
+@pytest.mark.parametrize(
+    ("platform", "expected", "unexpected"),
+    [
+        (
+            "kind",
+            "With topology-bound storage, only one replica can use the claim, leaving another replica Pending "
+            "and the deployment only partially Ready.",
+            "Multi-Attach",
+        ),
+        (
+            "openshift",
+            "With node- or zone-bound storage only one replica can use the claim: another replica stays Pending "
+            "or is stuck in ContainerCreating with a volume attach or Multi-Attach error",
+            "topology-bound",
+        ),
+    ],
+)
+def test_root_cause_text_depends_on_platform(monkeypatch, platform, expected, unexpected):
+    from sregym import cluster_platform
+    from sregym.conductor.problems import duplicate_pvc_mounts
+    from sregym.conductor.problems.duplicate_pvc_mounts import DuplicatePVCMounts
+
+    monkeypatch.setattr(cluster_platform, "_platform", platform)
+    monkeypatch.delenv("SREGYM_PLATFORM", raising=False)
+    monkeypatch.setattr(duplicate_pvc_mounts, "KubeCtl", lambda: Mock())
+    app = Mock(frontend_port=8080, namespace="social-network")
+    problem = DuplicatePVCMounts(app=app)
+
+    assert expected in problem.root_cause
+    assert unexpected not in problem.root_cause

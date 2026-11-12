@@ -10,9 +10,11 @@ singleBinary:
   nodeSelector: null
   tolerations: []
 
-# The gateway is the push endpoint. Its chart hardcodes
-# `resolver kube-dns.kube-system.svc.cluster.local.`, and OpenShift serves DNS
-# from `openshift-dns`, so the gateway cannot resolve Loki there. Promtail pushes
+# The gateway is the push endpoint. Its resolver defaults to
+# kube-dns.kube-system.svc.cluster.local, and OpenShift serves DNS from
+# `openshift-dns`, so the gateway may not resolve Loki there. The chart's
+# global.dnsService/dnsNamespace could point it at dns-default.openshift-dns (not
+# done yet). Promtail pushes
 # to the `loki` Service instead, and every reader (Grafana, the MCP Loki tools)
 # already uses it, so the gateway is switched off. The node settings below are
 # inert once it is disabled and are kept only so the file states the intent.

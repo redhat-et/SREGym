@@ -2,7 +2,8 @@
 #
 # The vendored chart pins its workloads to
 # `node-role.kubernetes.io/control-plane: ""` and tolerates that taint, because
-# the `kind` cluster has one node and it is the control plane. On a managed
+# kind-config.yaml has one control-plane and three workers; the chart's pins put
+# every observer on the control-plane node. On a managed
 # cluster the control-plane nodes are tainted, managed by the platform and not
 # SREGym's to schedule onto, so the pins are removed here.
 #
@@ -56,6 +57,7 @@ prometheus-blackbox-exporter:
 
 # One pod per node, on a node the platform manages. This subchart does honour
 # `enabled`, so it is switched off outright. Whether its port collides with the
-# platform's own node exporter is unverified; no node is available here to check.
+# platform's own node exporter would collide: measured, OpenShift's own node-exporter
+# holds hostNetwork port 9100 on every node.
 prometheus-node-exporter:
   enabled: false

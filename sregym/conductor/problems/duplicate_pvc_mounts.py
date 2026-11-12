@@ -1,3 +1,4 @@
+from sregym.cluster_platform import is_openshift
 from sregym.conductor.oracles.duplicate_pvc_mounts_mitigation import DuplicatePVCMountsMitigationOracle
 from sregym.conductor.oracles.llm_as_a_judge.llm_as_a_judge_oracle import LLMAsAJudgeOracle
 from sregym.conductor.problems.base import Problem
@@ -39,14 +40,25 @@ class DuplicatePVCMounts(Problem):
 
         super().__init__(app=app)
         self.kubectl = KubeCtl()
-        self.root_cause = self.build_structured_root_cause(
-            component=f"deployment/{self.faulty_service}",
-            namespace=self.namespace,
-            description=(
+        # Kind keeps main's reference text; the OpenShift wording names both symptoms the
+        # storage conflict produces there. The platform is set before problems are built.
+        if is_openshift():
+            cause = (
+                "The deployment is scaled to multiple replicas that all reference one ReadWriteOnce PVC while required "
+                "hostname anti-affinity separates those replicas. With node- or zone-bound storage only one replica can use "
+                "the claim: another replica stays Pending or is stuck in ContainerCreating with a volume attach or "
+                "Multi-Attach error, so the deployment is only partially Ready."
+            )
+        else:
+            cause = (
                 "The deployment is scaled to multiple replicas that all reference one ReadWriteOnce PVC while required "
                 "hostname anti-affinity separates those replicas. With topology-bound storage, only one replica can use "
                 "the claim, leaving another replica Pending and the deployment only partially Ready."
-            ),
+            )
+        self.root_cause = self.build_structured_root_cause(
+            component=f"deployment/{self.faulty_service}",
+            namespace=self.namespace,
+            description=cause,
         )
         self.diagnosis_oracle = LLMAsAJudgeOracle(problem=self, expected=self.root_cause)
         if self.faulty_service == "frontend":
