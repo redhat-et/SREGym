@@ -26,6 +26,22 @@ alertmanager:
 kube-state-metrics:
   nodeSelector: null
   tolerations: []
+  # kube-state-metrics had no pod on ROSA. Two constraints reject it, measured from the
+  # namespace's `FailedCreate` events and the SCC definitions:
+  #   anyuid (the grant `observe` already has, and what the rest of this stack runs under)
+  #     carries `seccompProfiles: null`, and rejects the pod with "seccomp may not be set"
+  #     because this chart sets `seccompProfile: RuntimeDefault` — the only workload here
+  #     that does;
+  #   restricted-v2 sets a UID from the namespace's range (`runAsUser: MustRunAsRange`) and
+  #     an fsGroup from the namespace's group range (`fsGroup: MustRunAs`), and the chart's
+  #     65534 is in neither.
+  # Unsetting the three fields leaves them for the constraint to supply, so the pod passes
+  # restricted-v2 while keeping its seccomp profile. `runAsNonRoot` stays and the supplied
+  # UID is not root. On `kind` this overlay is not applied and the chart's values stand.
+  securityContext:
+    runAsUser: null
+    runAsGroup: null
+    fsGroup: null
 
 prometheus-pushgateway:
   nodeSelector: null

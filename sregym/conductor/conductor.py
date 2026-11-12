@@ -623,20 +623,23 @@ class Conductor:
         self._warn_promtail_privileged()
 
     def _warn_promtail_privileged(self) -> None:
-        """Say once that Promtail's `privileged` grant is an unmeasured prerequisite.
+        """Say once that Promtail has no `privileged` grant, which costs every log line.
 
-        Warn-only, and only when this run deploys Loki. Promtail mounts the node's pod logs
-        through hostPath; the only ROSA evidence in hand shows it admitted without a binding of
-        ours, on a cluster-admin login. A restricted login has not been measured, so a missing
-        grant is reported, never refused, and the harness never runs the command it prints.
+        Warn-only, and only when this run deploys Loki. Measured on ROSA 4.22.18: without the grant
+        every promtail pod is refused, and with `hostmount-anyuid` the pods are admitted but cannot read
+        `/var/log/pods`, because the container carries the namespace's MCS label. Either way Loki holds
+        nothing and the Loki-backed tools return no log line for the whole run, so the warning says that
+        instead of hedging. It is still not a refusal: the fault lifecycle and the scores do not need
+        Promtail, and the harness never runs the command it prints.
         """
         if not getattr(getattr(self, "config", None), "deploy_loki", False):
             return
         if check_promtail_privileged(self.kubectl) is False:
             self.logger.warning(
-                "The privileged SCC is not granted to the promtail service account in observe. This is an "
-                "unmeasured prerequisite: Promtail may be admitted without it. If Loki shows no log lines, an "
-                "operator grants it once the first Loki deploy has created the service account:\n%s",
+                "No privileged SCC binding for the promtail service account in observe. Measured on ROSA: "
+                "Promtail then reads no log file at all, so Loki holds nothing and every Loki-backed tool "
+                "returns empty for this run. Grant it once per cluster, before or during the run; the "
+                "binding is cluster-scoped, so a teardown does not remove it:\n%s",
                 promtail_grant_command(),
             )
 

@@ -130,11 +130,18 @@ def test_loki_overlay_clears_the_pins_and_disables_the_gateway():
 
 
 def test_promtail_overlay_empties_the_tolerations_and_moves_the_client():
+    """Four keys, and each one earns its place: the toleration drops the control-plane taint, the client
+    moves off the disabled gateway, `defaultVolumes` backs the positions mount with an emptyDir because
+    SELinux refuses the chart's hostPath write, and the privileged container is the only state in which
+    the node's pod logs are readable at all (all measured on ROSA)."""
     overlay = overlay_values(PROMTAIL_OVERLAY)
 
-    assert set(overlay) == {"tolerations", "config"}
+    assert set(overlay) == {"tolerations", "config", "defaultVolumes", "containerSecurityContext"}
     assert overlay["tolerations"] == []
     assert overlay["config"]["clients"] == [{"url": LOKI_PUSH_URL}]
+    run = next(volume for volume in overlay["defaultVolumes"] if volume["name"] == "run")
+    assert run == {"name": "run", "emptyDir": {}}
+    assert overlay["containerSecurityContext"]["privileged"] is True
 
 
 def test_the_overlay_push_url_keeps_the_kind_push_path():

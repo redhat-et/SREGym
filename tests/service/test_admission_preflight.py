@@ -274,8 +274,27 @@ def test_the_promtail_review_asks_about_the_service_account_user():
     _assert_nothing_was_changed(kubectl)
 
 
+def test_the_promtail_review_is_asked_in_the_namespace_the_grant_lives_in():
+    """`add-scc-to-user -z promtail -n observe` writes a RoleBinding in `observe`, so a
+    cluster-scoped review answers no for a grant that is in place (measured on ROSA)."""
+    kubectl = _kubectl(_review(True))
+
+    check_promtail_privileged(kubectl)
+
+    spec = kubectl.authorization_v1_api.create_subject_access_review.call_args.args[0].spec
+    assert spec.resource_attributes.namespace == "observe"
+
+
 def test_the_promtail_command_is_the_exact_documented_one():
-    assert promtail_grant_command() == "oc adm policy add-scc-to-user privileged -z promtail -n observe"
+    """Cluster-scoped and idempotent, matching `rosa_prerun.sh`: the namespaced
+    `add-scc-to-user ... -n observe` writes a RoleBinding that `--teardown-observers` deletes and that
+    resolves a service account the first Loki deploy has not created yet."""
+    assert promtail_grant_command() == (
+        "oc create clusterrolebinding sregym-promtail-privileged"
+        " --clusterrole=system:openshift:scc:privileged"
+        " --serviceaccount=observe:promtail"
+        " --dry-run=client -o yaml | oc apply -f -"
+    )
 
 
 def test_the_promtail_check_is_unknown_when_the_review_is_refused_or_there_is_no_scc_api():
@@ -296,7 +315,9 @@ def test_a_missing_promtail_grant_warns_and_never_refuses(monkeypatch, caplog):
     with caplog.at_level(logging.WARNING, logger="test.admission_preflight"):
         conductor._verify_scc_grant()  # anyuid granted for three namespaces; promtail answers no
 
-    assert "unmeasured prerequisite" in caplog.text
+    # The warning states the measured cost, not a hedge: without the binding Promtail reads nothing.
+    assert "Loki holds nothing" in caplog.text
+    assert "every promtail pod is refused" in caplog.text or "reads no log file at all" in caplog.text
     assert promtail_grant_command() in caplog.text
 
 
@@ -308,4 +329,4 @@ def test_the_promtail_warning_is_skipped_without_loki(monkeypatch, caplog):
     with caplog.at_level(logging.WARNING, logger="test.admission_preflight"):
         conductor._verify_scc_grant()
 
-    assert "unmeasured prerequisite" not in caplog.text
+    assert "promtail" not in caplog.text.lower()

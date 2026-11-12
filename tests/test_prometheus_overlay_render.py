@@ -88,3 +88,24 @@ def test_the_overlay_keeps_the_components_that_serve_the_harness(rendered):
         "prometheus-prometheus-pushgateway",
         "prometheus-prometheus-blackbox-exporter",
     } <= names
+
+
+def test_kube_state_metrics_leaves_its_uid_and_fsgroup_to_the_constraint(rendered):
+    """kube-state-metrics had no pod on ROSA: `anyuid` rejects a pod that sets a seccomp
+    profile, and `restricted-v2` rejects the chart's 65534 UID and fsGroup. With the three
+    fields unset, the constraint supplies allowed ones and the pod passes `restricted-v2`.
+    The other four workloads keep the chart's values, because they run under `anyuid`."""
+    specs = {
+        document["metadata"]["name"]: spec
+        for document in rendered
+        for spec in pod_specs(document)
+        if document["kind"] in {"Deployment", "StatefulSet"}
+    }
+    kube_state_metrics = specs["prometheus-kube-state-metrics"].get("securityContext") or {}
+
+    for field in ("runAsUser", "runAsGroup", "fsGroup"):
+        assert field not in kube_state_metrics or kube_state_metrics[field] is None
+    assert kube_state_metrics.get("runAsNonRoot") is True
+    assert kube_state_metrics.get("seccompProfile") == {"type": "RuntimeDefault"}
+
+    assert specs["prometheus-server"]["securityContext"]["runAsUser"] == 65534

@@ -2,9 +2,10 @@
 #
 # The chart's default tolerations tolerate the control-plane taint, which on a
 # managed cluster would place a DaemonSet pod on a node that is not SREGym's.
-# Emptying the list drops that toleration. Whether that pod is also privileged, and
-# cannot be admitted under the restricted SCCs, is unverified; no OpenShift node is
-# available here to check.
+# Emptying the list drops that toleration. That the pod is also privileged is not a
+# guess: measured on ROSA 4.22.18, a narrower SCC admits the pod and then denies the
+# node's log tree, so `privileged` is the only state in which Promtail reads anything
+# (see `containerSecurityContext` below, and docs/openshift.md, "Loki and Promtail").
 tolerations: []
 
 # Pushes to the `loki` Service rather than the disabled gateway; see
@@ -12,3 +13,38 @@ tolerations: []
 config:
   clients:
     - url: http://loki.observe.svc.cluster.local:3100/loki/api/v1/push
+
+# Promtail's positions file is the only thing it writes outside its own image, and on OpenShift that
+# write is what SELinux refuses: the pod runs with the namespace's MCS label (measured on ROSA
+# 4.22.18: `seLinuxOptions: {level: s0:c34,c19}`) while the chart's `defaultVolumes` mount
+# `/run/promtail` from the host, so the container dies at startup with
+#   level=error msg="error creating promtail" error="open /run/promtail/positions.yaml: permission denied"
+# after the `hostmount-anyuid` SCC admitted it. Backing that one mount with an emptyDir keeps the path
+# `config.positions.filename` names, keeps `readOnlyRootFilesystem: true`, and needs no wider grant.
+# The two remaining hostPath mounts are read-only and are left exactly as the chart defines them.
+defaultVolumes:
+  - name: run
+    emptyDir: {}
+  - name: containers
+    hostPath:
+      path: /var/lib/docker/containers
+  - name: pods
+    hostPath:
+      path: /var/log/pods
+
+# Reading the node's pod logs is the part no narrower grant can do. Measured on ROSA 4.22.18 inside the
+# running pod under `hostmount-anyuid`:
+#   $ ls /var/log/pods
+#   ls: cannot open directory '/var/log/pods': Permission denied
+# The container's SELinux level is the `observe` namespace's MCS label (`s0:c34,c19`), which has no read
+# on the host log tree, so Promtail discovers 73 targets through the API and tails none of them:
+# `/ready` answers 500 "Unable to find any logs to tail" and `promtail_sent_bytes_total` stays 0.
+# A privileged container runs as `spc_t`, which is how OpenShift's own node log collectors read these
+# files. The operator grants the SCC (`PROMTAIL_SCC=privileged`, the default in `rosa_prerun.sh`); the
+# pod asks for it here. `readOnlyRootFilesystem` stays, and the positions mount stays an emptyDir.
+containerSecurityContext:
+  privileged: true
+  allowPrivilegeEscalation: true
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: []

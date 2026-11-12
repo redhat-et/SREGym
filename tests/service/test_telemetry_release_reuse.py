@@ -406,3 +406,86 @@ def test_promtail_redeploys_when_its_values_file_changes(monkeypatch, cluster, h
 
     helm.install.assert_called_once()
     assert helm.install.call_args.kwargs["extra_args"] == ["-f", str(values_file)]
+
+
+def test_promtail_uninstalls_a_stale_release_before_installing(monkeypatch, cluster, helm):
+    """A release that exists but does not run makes `helm install` fail with "cannot
+    reuse a name that is still in use"; it is removed first. A cluster that refused
+    Promtail's pods once could not deploy a second scenario without this."""
+    loki = Loki()
+    monkeypatch.setattr(loki, "_is_promtail_running", lambda: False)
+    helm.uninstall.side_effect = lambda **_: cluster.commands.append(["uninstall"])
+    helm.install.side_effect = lambda **_: cluster.commands.append(["install"])
+
+    loki._deploy_promtail()
+
+    helm.uninstall.assert_called_once_with(release_name="promtail", namespace="observe")
+    helm.install.assert_called_once()
+    assert cluster.commands.index(["uninstall"]) < cluster.commands.index(["install"])
+
+
+def test_promtail_reinstall_does_not_raise_when_its_pods_are_never_admitted(monkeypatch, cluster, helm):
+    """A cluster whose SCCs refuse Promtail's pods leaves the release installed and no
+    pod running. A repeated deploy must reinstall and return, not raise: the fault
+    lifecycle does not depend on Promtail, and failing here once failed every scenario."""
+    loki = Loki()
+    monkeypatch.setattr(loki, "_is_promtail_running", lambda: False)
+
+    loki._deploy_promtail()
+    helm.uninstall.reset_mock()
+    helm.install.reset_mock()
+
+    loki._deploy_promtail()
+
+    helm.uninstall.assert_called_once_with(release_name="promtail", namespace="observe")
+    helm.install.assert_called_once()
+
+# ----------------------------------------------------------- Promtail's running-and-ready question
+
+
+class _PodsListed:
+    """Answer the one `kubectl get pods` call `_is_promtail_running` makes."""
+
+    def __init__(self, listing):
+        self.listing = listing
+
+    def exec_command(self, command):  # noqa: ARG002 - the shape is what matters
+        return self.listing
+
+
+def test_a_running_and_ready_promtail_counts_as_running(monkeypatch):
+    monkeypatch.setattr(
+        "sregym.service.telemetry.loki.KubeCtl",
+        lambda: _PodsListed("NAME READY STATUS\npromtail-abc 1/1 Running"),
+    )
+
+    assert Loki()._is_promtail_running() is True
+
+
+def test_a_crash_looping_promtail_does_not_count_as_running(monkeypatch):
+    """A pod in CrashLoopBackOff must be reinstalled, not reused: this is the ROSA state under a
+    too-narrow SCC, and reusing the release there is what used to fail every scenario."""
+    monkeypatch.setattr(
+        "sregym.service.telemetry.loki.KubeCtl",
+        lambda: _PodsListed("NAME READY STATUS\npromtail-abc 0/1 CrashLoopBackOff"),
+    )
+
+    assert Loki()._is_promtail_running() is False
+
+
+def test_a_running_but_unready_promtail_does_not_count_as_running(monkeypatch):
+    monkeypatch.setattr(
+        "sregym.service.telemetry.loki.KubeCtl",
+        lambda: _PodsListed("NAME READY STATUS\npromtail-abc 0/1 Running"),
+    )
+
+    assert Loki()._is_promtail_running() is False
+
+
+def test_no_promtail_pod_does_not_count_as_running(monkeypatch):
+    monkeypatch.setattr(
+        "sregym.service.telemetry.loki.KubeCtl",
+        lambda: _PodsListed("No resources found in observe namespace."),
+    )
+
+    assert Loki()._is_promtail_running() is False

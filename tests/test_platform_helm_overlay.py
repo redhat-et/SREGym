@@ -54,7 +54,10 @@ def test_social_network_overlay_points_nginx_at_the_openshift_dns_service():
     assert values["global"]["nginx"]["resolverName"] == "dns-default.openshift-dns.svc.cluster.local"
 
 
-def test_astronomy_shop_overlay_unpins_the_grafana_ids_the_scc_refuses():
+def test_astronomy_shop_overlay_changes_only_the_ids_the_scc_refuses():
+    """One key. The app's collector keeps its shipped shape (`daemonset`, `hostMetrics`, hostPorts) and the
+    cluster is what adapts: `rosa_prerun.sh` grants it `hostaccess`. Trimming the workload here would move
+    the public benchmark's topology instead of the cluster's permissions."""
     from sregym.service.apps.astronomy_shop import AstronomyShop
 
     overlay = Path(base.PLATFORM_VALUES_DIR) / f"{AstronomyShop.platform_overlay_key}-openshift.yaml"

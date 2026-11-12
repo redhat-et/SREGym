@@ -79,6 +79,12 @@ clean. Drift that carries no label is not reset between scenarios, and the verdi
 object kinds it compares. Teardown runs once at the end of a suite run, so observers stay up across its
 scenarios.
 
+The verdict compares the object kinds it knows, node labels and taints, and the CoreDNS configuration.
+OpenShift has no `kube-system/coredns` ConfigMap, so that last comparison is empty on both sides and a change
+to the cluster's DNS configuration is invisible to the verdict. Each run on OpenShift logs
+`CoreDNS ConfigMap not found` when it takes the baseline (`logs/rosa-agent-run/network_policy_block.log`;
+`sregym/service/cluster_state.py` `_get_coredns_configmap_data` returns an empty mapping on a 404).
+
 ## Admission prerequisite
 
 Each scenario deploys an application into its own namespace. Those applications pin container users that
@@ -167,23 +173,101 @@ On OpenShift the harness deploys Loki and Promtail from the same charts as on ki
 - The Loki chart (7.5.0 at the time of writing) renders no Promtail of its own, so the `promtail:` block in the
   Loki overlay is inert; the only Promtail is the separate release.
 
-Whether log lines arrive is checked by an operator against a live run: `scripts/check_loki_ingest.sh` asks
-Loki for its labels and fails if there are none. No log line has been read from Loki on the ROSA cluster, so
-log ingestion on OpenShift is not a measured fact until that script has passed against a live run.
+Whether log lines arrive is checked by an operator against a live run with `scripts/check_loki_ingest.sh`.
+It reports the Promtail DaemonSet's counts and then asks Loki's own API for its labels through
+`oc port-forward` from the operator's workstation. It exits 0 when Loki returns labels, 1 when Loki answers
+and has none, and 2 when the query could not be made. The earlier version asked `wget` inside the Loki pod,
+which ships neither `wget` nor `curl`, so it could only ever report a failure of the tool.
+
+### What the cluster does with these releases (measured)
+
+Everything in this subsection is one ROSA cluster on 2026-11-11, cluster-admin login.
+
+**Loki runs.** Its API answers on port 3100 of `loki-0`.
+
+**Promtail needs a grant, and only one grant works.** Three states, each measured in turn:
+
+| Promtail's grant | What happened |
+|---|---|
+| none | the DaemonSet reads `desired 3, current 0, ready 0`: every pod is refused, with `hostPath volumes are not allowed` from `anyuid` and `restricted-v2` and `provider "privileged": Forbidden: not usable by user or serviceaccount` |
+| `hostmount-anyuid` | measured with the overlay's positions mount backed by an emptyDir and **without** a privileged container, the pods are admitted and `ls /var/log/pods` from inside answers `Permission denied`, because the container carries the `observe` namespace's MCS label (`s0:c34,c19`) and has no read on the host log tree; Loki received nothing. With the overlay as it ships today that SCC is not an option at all, because that SCC refuses a privileged container at admission |
+| `privileged` | 3/3 Running and Ready under `scc=privileged`, `privileged=true`, and Loki answers with labels: `{"status":"success","data":["app","component","container","filename","instance","job","namespace","node_name","pod","service_name","stream", …]}` |
+
+So log ingestion on OpenShift works with the `privileged` SCC and does not work without it. A privileged
+container runs as `spc_t`, which is how OpenShift's own node log collectors read these files; no narrower
+SCC can be given that read. The grant is the operator's, never the harness's, and the harness only reports
+its absence:
+
+```bash
+oc adm policy add-scc-to-user privileged -z promtail -n observe
+```
+
+The pre-step writes that grant as a **cluster-scoped `ClusterRoleBinding` naming the service account
+identity**, so it survives `--teardown-observers` deleting `observe` and needs applying once per cluster.
+`oc adm policy add-scc-to-user privileged -z promtail -n observe` also works but writes a RoleBinding
+*inside* `observe`, which the teardown then removes; both shapes admit the pods (measured: after the
+namespace-scoped binding was removed, a pod created with only the cluster-scoped one came back
+`scc=privileged`, ready). The harness's read-only check asks in `observe` because a namespaced binding is
+invisible to a cluster-scoped question (`sregym/service/admission_preflight.py`,
+`check_promtail_privileged`).
+
+Two limits a reader should carry. Promtail tails every namespace on the node, so Loki holds platform logs
+(`openshift-ovn-kubernetes`, `openshift-multus`) as well as the scenario's, exactly as it does on `kind` with
+the same values. And a fresh Promtail replays existing files from the start, which Loki answers `400` for
+entries older than its `reject_old_samples_max_age`; those batches are logged and dropped, and the newer
+lines arrive.
+
+**The same admission gap takes a second observer component.** `kube-state-metrics` from the Prometheus chart
+had no pod: its ReplicaSet was in `ReplicaFailure`/`FailedCreate`. Two constraints reject it. `anyuid`, the
+grant `observe` already has and what the rest of the stack runs under, carries `seccompProfiles: null` and
+answers `metadata.annotations[seccomp.security.alpha.kubernetes.io/pod]: Forbidden: seccomp may not be set`,
+because this is the only workload of the five that sets `seccompProfile: RuntimeDefault`. `restricted-v2`
+sets the UID from the namespace's range (`runAsUser: MustRunAsRange`) and the fsGroup from its group range
+(`fsGroup: MustRunAs`), and the chart's 65534 is in neither.
+
+`values-openshift.yaml` now unsets `runAsUser`, `runAsGroup` and `fsGroup` for that subchart, which leaves
+them for `restricted-v2` to supply and keeps the seccomp profile; `tests/test_prometheus_overlay_render.py`
+pins the rendered result. **Measured on the same ROSA cluster afterwards:** the pod runs 1/1 under
+`restricted-v2` with `fsGroup: 1001160000` supplied by the constraint, `seccompProfile: RuntimeDefault`
+kept, and its Service has an endpoint at `10.128.4.15:8080` for Prometheus to scrape. Whether the agent's
+`get_metrics` returns `kube_*` series in a scored run is not yet measured.
+
+**The app's own collector keeps its shipped shape; the cluster adapts.** Astronomy Shop's chart runs its
+collector as a DaemonSet that mounts `hostPath: /` at `/hostfs` (the `hostMetrics` preset) and declares
+hostPorts 6831, 14250, 14268, 4317, 4318 and 9411. That is the public benchmark's topology and it stays:
+no values file is changed for it. No SCC on the cluster admitted it, so the DaemonSet read zero pods, the
+`otel-collector` Service it backs had no endpoints, and **every component's OTLP export was refused** —
+Astronomy Shop had no traces and no span metrics, while `kind` has them, and the broken workload produced one
+wrong agent diagnosis. The operator grant is `hostaccess`, the narrowest SCC that admits this pod: it allows a
+host directory and host ports and no privileged container, and it assigns uids from the namespace's own
+ranges, which the pod accepts because it pins no uid, fsGroup or seccomp.
+
+```bash
+oc create clusterrolebinding sregym-astronomy-collector-hostaccess \
+  --clusterrole=system:openshift:scc:hostaccess --serviceaccount=astronomy-shop:otel-collector
+```
+
+`rosa_prerun.sh` applies it, cluster-scoped so the per-scenario namespace being deleted does not remove it.
+`tests/test_astronomy_shop_overlay_render.py` pins both halves: the overlay must not touch the collector, and
+the shipped shape must still carry the host mount and the six host ports that justify the grant.
+
+**Measured on ROSA 4.22.18, 2026-11-12**: with the grant in place the DaemonSet reads `3 3 3 3 3`, every pod
+Running with `openshift.io/scc: hostaccess` (a server-side dry run of the pod had already shown the uid and
+fsGroup taken from the namespace range, `1001070000`), the collector logs `Everything is ready`, the
+`otel-collector` Service carries three pod addresses, and the whole `env_variable_shadowing_astronomy_shop`
+validator run passed in 323 s with a `CLEAN` damage verdict. Two receiver-level errors remain and are not
+admission problems: the `hostmetrics` filesystem scraper reports missing paths under `/hostfs`, and the
+`kubeletstats` receiver cannot reach `/stats/summary`. Whether `kind` shows the same two is not measured.
+
+A release whose pods are refused used to be fatal: the next run called `helm install` on a release that still
+existed and Helm refused it with `cannot reuse a name that is still in use`, which failed the deploy of every
+scenario. The harness now removes a Promtail release that does not run before it installs again
+(`sregym/service/telemetry/loki.py`, `_deploy_promtail`), the same way it already handled Loki.
 
 ## Unverified
 
-Two claims are not proven. This page does not claim either one.
+One claim is not proven. This page does not claim it.
 
-- **H8, Promtail's `privileged`.** The rendered Promtail chart does not set `privileged`. It runs as uid 0 with
-  `hostPath` mounts of `/var/log/pods`, `/var/lib/docker/containers` and `/run/promtail`. The SELinux reason for
-  a privileged container exists only in a values-file comment. One agent run with the `full` profile deployed Loki
-  and Promtail on the ROSA cluster with a cluster-admin login and went through, and the operator's readiness notes
-  record Promtail admitted without a binding of ours. Neither shows what a restricted login needs, and neither
-  shows that logs were read. The harness checks a `privileged` grant for the `promtail` service account read-only
-  and only warns; `scripts/rosa_prerun.sh` applies it only with `PROMTAIL_SCC=privileged`. The default agent
-  run, which deploys Loki, is outside the supported scope until it is measured on a restricted login. That is a
-  scope statement, not an omission.
 - **H17, the chart node-exporter's `hostPort` 9100** against the port OpenShift's own node-exporter
   holds. The overlay disables the chart's DaemonSet, so the collision never arises on OpenShift. The chart's
   DaemonSet uses `hostNetwork`, `hostPID` and a host-root mount, which `anyuid` does not admit, so enabling it
@@ -192,14 +276,34 @@ Two claims are not proven. This page does not claim either one.
 
 ## Running it
 
-Once per cluster, as a cluster-admin, run the operator prerequisites. The harness never runs them; it only
-checks them and prints the command for a gap. The script qualifies the submodule image references and grants
-`anyuid` to the three application namespaces. `PROMTAIL_SCC=privileged` adds the unmeasured Promtail grant,
-and only once the `promtail` service account exists, that is after the first Loki deploy.
+**The pre-step: one command, once per cluster, before any run.** This is step 0 of every command further
+down, and the only place that changes a cluster on the operator's behalf. Run it as a cluster-admin. The
+harness never runs it; the harness only checks and prints the command for a gap.
 
 ```bash
-scripts/rosa_prerun.sh
+scripts/rosa_prerun.sh            # apply everything, then report whether the cluster is ready
+DRY_RUN=1 scripts/rosa_prerun.sh  # print every change, make none
 ```
+
+What it does, in order, and each step is idempotent:
+
+| Step | What it changes, or checks |
+|---|---|
+| Preflight | `oc whoami` answers, the cluster is OpenShift, `SREGYM_ALLOW_UNVERIFIED_PLATFORM` is unset, no other harness process runs |
+| Images | Qualifies the unqualified references in `SREGym-applications`; without it every Hotel Reservation scenario is refused by the image preflight |
+| Admission | Grants `anyuid` to `system:serviceaccounts:{social-network,hotel-reservation,astronomy-shop}`, in group form so the grant outlives the per-scenario namespace |
+| Promtail | Applies a cluster-scoped `ClusterRoleBinding` named `sregym-promtail-<scc>` that gives the `observe/promtail` service account the `privileged` SCC, the only grant under which Promtail can read the node's pod logs (see [Loki and Promtail](#loki-and-promtail)). It needs no namespace to exist, survives a teardown, and is not labelled `sregym.io/owned`, because it is the operator's standing grant rather than the harness's object. `PROMTAIL_SCC=none` skips it and exits 2; `hostmount-anyuid` is refused, because the overlay asks for a privileged container and that SCC does not admit one, so it can never work. The undo line is printed |
+| Storage | Checks that a storage class named `STORAGE_CLASS` (default `gp3`) exists |
+| Capacity | Counts untainted, schedulable, Ready workers and warns below two, which `internal_traffic_policy_local_astronomy_shop` and `duplicate_pvc_mounts_social_network` need |
+| Credentials | Checks that `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN` is set in the shell that will run `main.py` |
+| Leftovers | Reports namespaces and `sregym.io/owned` objects that exist before the run, with the command to remove them; it removes nothing itself |
+| Next | Prints the `--suite sregym-lite` command with the flags an OpenShift run requires, and the Loki ingestion check |
+
+It exits 0 when the cluster is ready, 1 when a step failed, and 2 when something only the operator can supply
+is missing. Which one it is, is printed. The script grants nothing on the harness's behalf: it is the
+operator's, and the harness still only reports a gap. It never deletes anything either — leftovers are named
+with the command that removes them. `scripts/rosa_oracle_all.sh` calls it as well, and runs its sweep even
+when the answer is 2, because the oracle needs only the images and the `anyuid` grants.
 
 The three commands, in the order they earn their cost. Substitute the cluster's own storage class.
 
@@ -260,6 +364,7 @@ them. The operator holds them. Each `works` reason in `PLATFORM_SUPPORT` cites `
 | The 16 runnable Lite scenarios passed the oracle lifecycle (deploy, inject, oracle fails, recover, oracle passes, clean up, damage verdict). | `logs/rosa-oracle-all/<scenario>.json`, `RESULTS.txt`, `damage.json` | Each scenario has a passing final attempt (`platform: openshift`). Four needed a retry: `internal_traffic_policy_local_astronomy_shop` took six attempts, and `network_policy_block`, `finalizer_deadlock_controller_hotel_reservation` and `unschedulable_incorrect_port_assignment` took two each. Retry causes are not in the logs. Group skips after a first failure make the sequence in `RESULTS.txt` interleaved, not one clean run. The final damage verdict is `owned`: only objects the harness created were removed. |
 | `rolling_update_misconfigured_social_network` passed end to end. | `logs/rosa-rolling-update/run2-validation-summary.md` and `run2-damage.json` | `validate_problem` passed with damage verdict `clean`, after the nginx resolver overlay. The first attempt (`run1.out`, `validation.json`) failed at deploy with `PodReadinessTimeout` after 825 s. |
 | An agent run on that scenario completed the lifecycle. | `results/1106_1310/claudecode_ALL_results.csv`, `damage.json`, and `logs/rosa-rolling-update/cache-run3/cluster_baseline_state.json` (the platform record) | `claudecode` ran with `--internet-access open`. Diagnosis succeeded. Mitigation failed with `failure_class: agent_error` and `reason: fault_still_present`. The damage verdict is `clean`. The result shows that the harness runs the agent lifecycle on the cluster; it does not show agent success, and no log line was read from Loki in it. |
+| Observer admission (measured 2026-11-11): `kube-state-metrics` fixed, Promtail needs `privileged`. | `logs/rosa-full-suite-lite.log`, `logs/sregym_1111_1522.log`, and the `observe` namespace's events on the cluster | Promtail's DaemonSet reads `desired 3, current 0, ready 0`: every promtail pod is refused by every security context constraint, so Loki holds no log line. `kube-state-metrics` had no pod at all: its ReplicaSet is in `ReplicaFailure`/`FailedCreate` on `restricted-v2` group and uid rules, so the agent's metrics view has no `kube_*` series. The same state had made every scenario's deploy fail, because `helm install` on the refused Promtail release returns `cannot reuse a name that is still in use`; that is fixed in `_deploy_promtail`. |
 
 Two consequences when you read a claim here:
 

@@ -6,6 +6,35 @@ question that matters afterwards: **did this run harm the cluster?** For the pla
 
 ## 1. Before the run
 
+### On OpenShift, first
+
+One command makes a cluster ready for a SREGym Lite run, and everything a run needs from the operator is in
+it. Run it once per cluster as a cluster-admin, before any of the commands below:
+
+```bash
+scripts/rosa_prerun.sh            # apply, then report whether the cluster is ready
+DRY_RUN=1 scripts/rosa_prerun.sh  # print every change, make none
+```
+
+It qualifies the submodule image references, grants `anyuid` to the three application namespaces, creates a
+cluster-scoped `ClusterRoleBinding` that gives the `observe/promtail` service account the `privileged` SCC,
+and then checks what the run needs and does not change it: the storage class, at least two untainted
+schedulable workers, the Anthropic credentials, and leftovers from an earlier run.
+
+That Promtail binding is required, not optional: measured on ROSA, without it every promtail pod is refused,
+and with `hostmount-anyuid` instead the pods are admitted and cannot read `/var/log/pods`. **It is also a
+durable escalation path** — any pod that can use the `observe/promtail` service account may be privileged
+cluster-wide, not only in `observe` — so it is not labelled `sregym.io/owned`, a teardown does not remove it,
+and the runbook keeps its undo line:
+
+```bash
+oc delete clusterrolebinding sregym-promtail-privileged
+```
+
+Exit `0` means ready, `1` a step failed, `2` something only the operator can supply is missing; the output
+names which, and every step is listed in [openshift.md](openshift.md#running-it). The harness itself grants
+nothing: it checks and prints.
+
 On kind, which is the default:
 
 ```bash

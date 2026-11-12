@@ -4,9 +4,10 @@
 # The 17th, service_dns_resolution_failure_social_network, is excluded: it writes kube-system/coredns.
 # A failure does not stop the loop, except that after the first failure inside an app group the
 # rest of that group is skipped (the same defect would repeat for each scenario).
-# Before the loop it also (1) qualifies the unqualified image references in the submodule manifests
-# (scripts/qualify_submodule_images.py --apply; undo with --revert) and (2) grants the anyuid SCC to
-# the app namespaces. Both are cluster/tree changes made by YOU running this script.
+# Before the loop it runs scripts/rosa_prerun.sh, which makes the cluster ready: it qualifies the
+# unqualified image references in the submodule manifests, grants the anyuid SCC to the app namespaces
+# and an SCC to Promtail's service account, then reports the rest. Those are cluster/tree changes made by
+# YOU running this script; the harness never makes them.
 # Usage: scripts/rosa_oracle_all.sh [output-dir]      (default: logs/rosa-oracle-all)
 # Env:   KEEP_GOING=1  keep running a group after a failure (default: skip the rest of the group)
 #        ONLY="hotel"  run only the named groups (social hotel astronomy), e.g. ONLY="hotel astronomy"
@@ -15,8 +16,17 @@ set -u
 OUT="${1:-logs/rosa-oracle-all}"
 mkdir -p "$OUT"
 
-echo "== Operator prerequisites (image qualification, anyuid grants) =="
-bash "$(dirname "$0")/rosa_prerun.sh" || exit 1
+echo "== Operator prerequisites (scripts/rosa_prerun.sh) =="
+bash "$(dirname "$0")/rosa_prerun.sh"
+prerun_rc=$?
+if [ "$prerun_rc" -eq 1 ]; then
+  echo "rosa_prerun failed a step; not starting the sweep" | tee -a "$OUT/RESULTS.txt"
+  exit 1
+fi
+if [ "$prerun_rc" -eq 2 ]; then
+  echo "rosa_prerun reports prerequisites that only an operator can supply; the oracle sweep needs the" \
+       "images and the anyuid grants only, so it continues. See the report above." | tee -a "$OUT/RESULTS.txt"
+fi
 
 echo "== Platform support check (no cluster access) =="
 SREGYM_PLATFORM=openshift uv run python -c "import main; main.platform_support_skips('sregym-lite')" | grep Skipping

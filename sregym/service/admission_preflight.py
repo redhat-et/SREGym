@@ -39,12 +39,17 @@ SCC_NAME = "anyuid"
 SCC_API_GROUP = "security.openshift.io"
 SCC_RESOURCE = "securitycontextconstraints"
 
-# Promtail reads the node's pod logs through hostPath mounts and runs as uid 0. The upstream
-# worktree's ROSA notes record it admitted by the `privileged` SCC with no binding of ours, on a
-# cluster-admin login, so this grant is an unmeasured prerequisite and never a refusal.
+# Promtail reads the node's pod logs through hostPath mounts. Measured on ROSA 4.22.18: with no binding
+# every promtail pod is refused; with `hostmount-anyuid` the pods are admitted and `ls /var/log/pods`
+# answers Permission denied, because the container carries the namespace's MCS label; with
+# `privileged` Promtail is 3/3 Ready and Loki returns labels. So the grant is required, it must be
+# `privileged`, and log ingestion is silently lost without it. It stays a warning rather than a refusal
+# because the harness gates a platform fact, not the operator's cluster state, and the run has other
+# stages worth completing.
 PRIVILEGED_SCC = "privileged"
 PROMTAIL_NAMESPACE = "observe"
 PROMTAIL_SERVICE_ACCOUNT = "promtail"
+PROMTAIL_BINDING_NAME = "sregym-promtail-privileged"
 
 GRANTED = "granted"
 MISSING = "missing"
@@ -57,8 +62,20 @@ def grant_command(namespace: str) -> str:
 
 
 def promtail_grant_command() -> str:
-    """Return the exact command that grants the `privileged` SCC to Promtail's service account."""
-    return f"oc adm policy add-scc-to-user {PRIVILEGED_SCC} -z {PROMTAIL_SERVICE_ACCOUNT} -n {PROMTAIL_NAMESPACE}"
+    """Return the exact command that grants the `privileged` SCC to Promtail's service account.
+
+    Cluster-scoped on purpose, and idempotent: `oc adm policy add-scc-to-user ... -n observe` writes a
+    RoleBinding *inside* `observe`, which `--teardown-observers` deletes, so it would be needed again
+    every campaign, and it resolves the service account that the first Loki deploy has not created yet.
+    A ClusterRoleBinding naming the service account identity needs nothing to exist and survives the
+    teardown. `--dry-run=client -o yaml | oc apply -f -` makes the printed command safe to run twice.
+    """
+    return (
+        f"oc create clusterrolebinding {PROMTAIL_BINDING_NAME}"
+        f" --clusterrole=system:openshift:scc:{PRIVILEGED_SCC}"
+        f" --serviceaccount={PROMTAIL_NAMESPACE}:{PROMTAIL_SERVICE_ACCOUNT}"
+        " --dry-run=client -o yaml | oc apply -f -"
+    )
 
 
 def grant_commands(namespaces: Iterable[str]) -> list[str]:
@@ -150,7 +167,14 @@ def check_promtail_privileged(kubectl) -> bool | None:
     Answers None on a cluster without the SCC API and when the review is refused (403), the
     same two cases `check_scc_grant` reports as unverifiable. The subject is the service
     account user, because the documented grant is `add-scc-to-user -z promtail`; a review for
-    the namespace group would answer false for a user binding. Read-only: nothing is granted.
+    the namespace group would answer false for a user binding.
+
+    The review names `observe`, because that is where the grant lives: `oc adm policy
+    add-scc-to-user ... -z promtail -n observe` writes a RoleBinding in that namespace, so the
+    same question asked cluster-scoped answers no while `oc auth can-i use scc/privileged -n
+    observe --as=system:serviceaccount:observe:promtail` answers yes (measured on ROSA
+    4.22.18). Asking without the namespace reported a missing grant that was in place, and its
+    warning could not be cleared by following it. Read-only: nothing is granted.
     """
     if not serves_scc_api(kubectl):
         return None
@@ -164,6 +188,7 @@ def check_promtail_privileged(kubectl) -> bool | None:
                 "system:authenticated",
             ],
             resource_attributes=client.V1ResourceAttributes(
+                namespace=PROMTAIL_NAMESPACE,
                 group=SCC_API_GROUP,
                 resource=SCC_RESOURCE,
                 name=PRIVILEGED_SCC,

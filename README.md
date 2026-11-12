@@ -89,7 +89,8 @@ SREGym can run on a managed OpenShift cluster. It has been measured on one manag
 - Declare the platform with `--platform openshift`. The cluster has to confirm it.
 - Pass `--storage-class <the cluster's own class>`. The default class names OpenEBS, and the harness refuses it on OpenShift.
 - Pass `--internet-access open` for agent runs. Filtered access needs a network tier that OpenShift's OVN-Kubernetes does not provide.
-- `--noise` (Chaos Mesh) is refused on OpenShift. Once per cluster, an operator runs `scripts/rosa_prerun.sh`.
+- `--noise` (Chaos Mesh) is refused on OpenShift.
+- **Before the first run, once per cluster, an operator runs `scripts/rosa_prerun.sh`.** It qualifies the submodule image references, grants `anyuid` to the three application namespaces and an SCC to Promtail's service account, then checks the storage class, the worker count, the Anthropic credentials and leftovers from an earlier run, and prints the command to run next. `DRY_RUN=1 scripts/rosa_prerun.sh` prints every change and makes none. Every step, and the exit codes, are listed in [docs/openshift.md](./docs/openshift.md#running-it). The harness never grants a permission itself: it checks and prints the command for a gap.
 
 Support, refusals and unverified claims are in [docs/openshift.md](./docs/openshift.md).
 

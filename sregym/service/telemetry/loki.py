@@ -150,6 +150,16 @@ class Loki:
             self.logger.info("Promtail runs the requested values. Skipping redeployment.")
             return
 
+        # A release record that is not running makes `helm install` fail with "cannot
+        # reuse a name that is still in use", which fails the deploy of every scenario:
+        # a cluster that refused Promtail's pods once could not run a second scenario at
+        # all. Promtail's DaemonSet is not running for two reasons on a managed cluster,
+        # the values changed or no security context constraint admits its pods, and only
+        # an uninstalled release is installable again. `uninstall` is a no-op when no
+        # release exists, so a first run is unchanged.
+        self.logger.info("Promtail does not run the requested values. Reinstalling the release.")
+        Helm.uninstall(release_name=self.promtail_release_name, namespace=self.namespace)
+
         self.logger.info("Deploying Promtail for Loki log collection...")
         Helm.install(**helm_configs)
         Helm.record_values_fingerprint(helm_configs)
@@ -169,12 +179,24 @@ class Loki:
         }
 
     def _is_promtail_running(self) -> bool:
-        """Check if Promtail is already running in the cluster."""
+        """Whether at least one Promtail pod is Running *and* ready.
+
+        Readiness is part of the question, not just the pod phase: a pod in `CrashLoopBackOff` or one
+        that runs and never becomes ready shows `Running` in the STATUS column while ingesting nothing,
+        and a release in that state must be reinstalled rather than reused. Measured on ROSA 4.22.18: a
+        Promtail admitted by a too-narrow SCC is exactly that pod.
+        """
         command = f"kubectl get pods -n {self.namespace} -l app.kubernetes.io/name=promtail"
         try:
             result = KubeCtl().exec_command(command)
-            if "Running" in result:
-                return True
         except subprocess.CalledProcessError:
             return False
+        for line in result.splitlines()[1:]:
+            fields = line.split()
+            if len(fields) < 3:
+                continue
+            ready, status = fields[1], fields[2]
+            containers = ready.split("/")
+            if status == "Running" and len(containers) == 2 and containers[0] == containers[1] != "0":
+                return True
         return False
