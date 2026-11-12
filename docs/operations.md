@@ -24,7 +24,7 @@ schedulable workers, the Anthropic credentials, and leftovers from an earlier ru
 That Promtail binding is required, not optional: measured on ROSA, without it every promtail pod is refused,
 and with `hostmount-anyuid` instead the pods are admitted and cannot read `/var/log/pods`. **It is also a
 durable escalation path** — any pod that can use the `observe/promtail` service account may be privileged
-cluster-wide, not only in `observe` — so it is not labelled `sregym.io/owned`, a teardown does not remove it,
+cluster-wide, not only in `observe` — so it carries no harness label, a teardown does not remove it,
 and the runbook keeps its undo line:
 
 ```bash
@@ -155,8 +155,8 @@ The verdict is one of three:
 
 Additions alone are not damage: a run is supposed to create objects, and without a teardown the
 observer stack staying up is the requested state. That is why the survivor check runs only when
-`--teardown-observers` was passed: with a teardown requested, anything still carrying SREGym's
-ownership label is a leftover, and leftovers are what this check exists to catch.
+`--teardown-observers` was passed: with a teardown requested, anything still owned by the harness
+(the infrastructure label, a Helm release it deployed, or a ledger entry matched by UID) is a leftover, and leftovers are what this check exists to catch.
 
 A `damaged` verdict fails the run regardless of its score, and `damage.json` is written beside the
 results before the run stops.
@@ -187,7 +187,7 @@ preflight checks storage.
 Observers are **not** torn down by default: an iterate-fast loop reuses them. Pass
 `--teardown-observers` to remove the stack at the end of a campaign — the Helm releases, the
 volumes Helm retains on purpose (the Prometheus one is 8 GiB), and the cluster-scoped objects this
-harness created, which are found by ownership label and never by name. Reuse is safe only while
+harness created, which are found by the infrastructure label or the Helm release, and by ledger UID, and never by name. Reuse is safe only while
 the chart version and the values are unchanged; a changed fingerprint forces a redeploy, so a
 stale observer stack cannot silently serve a different configuration.
 
